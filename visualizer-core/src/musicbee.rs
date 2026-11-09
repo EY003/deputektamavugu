@@ -42,11 +42,17 @@ pub fn log_smtc(msg: &str) {
 ///
 /// `should_quit` is set to `true` by the main app when it wants the thread
 /// to stop. The thread runs while `should_quit` is `false`.
-pub fn spawn_smtc_listener(
+///
+/// `on_update` is called after every `TrackInfo` that was sent, so the UI can
+/// wake up from idle (the UI no longer repaints on its own).
+pub fn spawn_smtc_listener<F>(
     tx: Sender<TrackInfo>,
     should_quit: Arc<AtomicBool>,
     session_count: Arc<AtomicUsize>,
-) {
+    on_update: F,
+) where
+    F: Fn() + Send + 'static,
+{
     std::thread::spawn(move || {
         log_smtc("SMTC: worker thread started.");
 
@@ -86,6 +92,8 @@ pub fn spawn_smtc_listener(
 
         // ── 3. Poll loop — runs while should_quit is FALSE ────
         while !should_quit.load(Ordering::Relaxed) {
+            // Poll slower when there is no media session at all.
+            let mut poll_ms: u64 = 1000;
             match manager.GetSessions() {
                 Ok(sessions) => {
                     let count = match sessions.Size() {
@@ -98,6 +106,9 @@ pub fn spawn_smtc_listener(
                     session_count.store(count, Ordering::Relaxed);
 
                     let session = pick_best_session(&sessions);
+                    if session.is_none() {
+                        poll_ms = 2000;
+                    }
 
                     if let Some(session) = session {
                         if let Ok(props) =
@@ -137,6 +148,7 @@ pub fn spawn_smtc_listener(
                                     album,
                                     cover_art,
                                 });
+                                on_update();
                             }
                         }
                     } else if !last_title.is_empty() {
@@ -151,6 +163,7 @@ pub fn spawn_smtc_listener(
                             album: String::new(),
                             cover_art: None,
                         });
+                        on_update();
                     }
                 }
                 Err(e) => {
@@ -159,7 +172,7 @@ pub fn spawn_smtc_listener(
                 }
             }
 
-            std::thread::sleep(Duration::from_millis(500));
+            std::thread::sleep(Duration::from_millis(poll_ms));
         }
 
         log_smtc("SMTC: polling loop exited. Thread shutting down.");
