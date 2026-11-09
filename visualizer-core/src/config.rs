@@ -1049,6 +1049,8 @@ pub struct AppConfig {
     #[serde(default)] pub bg_color: [u8; 3],
     pub x_offset: f32, pub y_offset: f32,
     pub max_bar_height: f32, pub show_fps: bool,
+    /// Upper bound for overlay redraws per second (15..=60).
+    #[serde(default = "default_max_fps")] pub max_fps: u32,
     #[serde(default = "default_height_scale")] pub height_scale: f32,
 
     // Opacity / menu
@@ -1109,6 +1111,7 @@ fn default_visualizer_opacity() -> u8 { DEFAULT_VISUALIZER_OPACITY }
 fn default_settings_scale() -> f32 { DEFAULT_SETTINGS_SCALE }
 fn default_open_settings_on_launch() -> bool { DEFAULT_OPEN_SETTINGS_ON_LAUNCH }
 fn default_show_help_text() -> bool { DEFAULT_SHOW_HELP_TEXT }
+fn default_max_fps() -> u32 { 60 }
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -1118,6 +1121,7 @@ impl Default for AppConfig {
             x_offset: DEFAULT_X_OFFSET, y_offset: DEFAULT_Y_OFFSET,
             max_bar_height: DEFAULT_MAX_BAR_HEIGHT,
             show_fps: false,
+            max_fps: 60,
             height_scale: DEFAULT_HEIGHT_SCALE,
             visualizer_opacity: DEFAULT_VISUALIZER_OPACITY,
             settings_scale: DEFAULT_SETTINGS_SCALE,
