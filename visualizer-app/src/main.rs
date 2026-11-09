@@ -58,6 +58,22 @@ fn load_icon() -> (egui::IconData, tray_icon::Icon) {
 // Small utilities
 // ═══════════════════════════════════════════════════════════════
 
+/// Wake the OVERLAY window. Never use `ctx.request_repaint()` from another
+/// thread: in egui 0.27 it targets "the viewport currently being run", which
+/// is the settings window while it is being painted (mouse moving over it).
+/// That sent the wake-ups to the wrong window and froze the bars.
+fn wake_root(ctx: &egui::Context) {
+    ctx.request_repaint_of(egui::ViewportId::ROOT);
+}
+
+fn try_lock_state(m: &Mutex<SettingsState>) -> Option<std::sync::MutexGuard<'_, SettingsState>> {
+    match m.try_lock() {
+        Ok(g) => Some(g),
+        Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
 fn hash_u32(mut x: u32) -> u32 {
     x ^= x >> 16;
     x = x.wrapping_mul(0x85EB_CA6B);
@@ -494,6 +510,7 @@ struct SettingsState {
     audio_dirty: bool,
     close_requested: bool,
     last_fingerprint: u64,
+    last_fp_check: Instant,
     old_settings_scale: f32,
 
     new_preset_name: String,
@@ -539,6 +556,10 @@ struct VisualizerApp {
     current_peaks: Vec<f32>,
     last_bpm: f32,
     audio_rx: crossbeam_channel::Receiver<BarFrame>,
+    /// true while the overlay is animating and re-arms its own repaints
+    /// (audio threads then must NOT wake it, so the FPS cap is respected).
+    ui_active: Arc<AtomicBool>,
+    palette_mirrored: bool,
     audio_settings: Arc<ArcSwap<visualizer_core::config::AudioSettings>>,
     should_quit: Arc<AtomicBool>,
     current_fps: f32,
@@ -578,7 +599,13 @@ impl VisualizerApp {
 
         // Audio thread wakes the UI whenever it publishes a frame.
         let audio_ctx = ctx.clone();
-        let engine = AudioEngine::new(config.audio.clone(), move || audio_ctx.request_repaint());
+        let ui_active = Arc::new(AtomicBool::new(false));
+        let ui_active_audio = ui_active.clone();
+        let engine = AudioEngine::new(config.audio.clone(), move || {
+            if !ui_active_audio.load(Ordering::Acquire) {
+                wake_root(&audio_ctx);
+            }
+        });
         let should_quit = Arc::new(AtomicBool::new(false));
         musicbee::log_smtc("APP: Initializing VisualizerApp.");
         let audio_settings = engine.settings.clone();
@@ -591,7 +618,7 @@ impl VisualizerApp {
             track_tx,
             should_quit.clone(),
             smtc_session_count.clone(),
-            move || smtc_ctx.request_repaint(),
+            move || wake_root(&smtc_ctx),
         );
 
         let (egui_icon, tray_icon_img) = load_icon();
@@ -627,7 +654,7 @@ impl VisualizerApp {
                               else { None };
                     if let Some(cmd) = cmd {
                         let _ = tx.send(cmd);
-                        wake.request_repaint();
+                        wake_root(&wake);
                     }
                 }
             });
@@ -640,7 +667,7 @@ impl VisualizerApp {
                 while let Ok(event) = rx.recv() {
                     if event.state == global_hotkey::HotKeyState::Pressed {
                         let _ = tx.send(UiCmd::ToggleSettings);
-                        wake.request_repaint();
+                        wake_root(&wake);
                     }
                 }
             });
@@ -654,6 +681,7 @@ impl VisualizerApp {
             audio_dirty: false,
             close_requested: false,
             last_fingerprint: config_fingerprint(&config),
+            last_fp_check: Instant::now(),
             old_settings_scale: config.settings_scale,
             new_preset_name: String::new(),
             new_audio_preset_name: String::new(),
@@ -673,6 +701,8 @@ impl VisualizerApp {
             current_peaks: vec![0.0; num_bars],
             last_bpm: 0.0,
             audio_rx: engine.frame_rx,
+            ui_active,
+            palette_mirrored: true,
             audio_settings,
             config,
             should_quit,
@@ -3198,6 +3228,11 @@ impl SettingsState {
         checkbox_reset(ui, &mut self.config.show_fps, "Show FPS Counter", false);
         ui.label(format!("Current FPS: {:.1}", self.current_fps));
         ui.add_space(6.0);
+        ui.add(egui::Slider::new(&mut self.config.max_fps, 15..=60).text("Max FPS (lower = less GPU/DWM load)"));
+        if self.config.max_fps != 60 && ui.small_button("Reset to 60").clicked() {
+            self.config.max_fps = 60;
+        }
+        ui.add_space(6.0);
         
     }
 
@@ -3318,9 +3353,27 @@ fn run_settings_viewport(
     }
 
      // Did this frame change anything the overlay cares about?
-    let fp = config_fingerprint(&st.config);
-    let changed = st.audio_dirty || fp != st.last_fingerprint;
-    st.last_fingerprint = fp;
+    // Serialising the whole config is not free, so only do it when the user
+    // actually interacted (not on plain mouse-move frames), plus a slow
+    // safety re-check in case something changed without input.
+    let interacted = ctx.input(|i| {
+        i.pointer.any_down()
+            || i.pointer.any_released()
+            || i.events.iter().any(|e| !matches!(
+                e,
+                egui::Event::PointerMoved(_) | egui::Event::PointerGone | egui::Event::WindowFocused(_)
+            ))
+    });
+    let due = st.last_fp_check.elapsed() > std::time::Duration::from_millis(300);
+    let mut changed = st.audio_dirty;
+    if interacted || due || st.audio_dirty {
+        let fp = config_fingerprint(&st.config);
+        if fp != st.last_fingerprint {
+            changed = true;
+            st.last_fingerprint = fp;
+        }
+        st.last_fp_check = Instant::now();
+    }
     
     let wants_close = st.close_requested;
     st.close_requested = false;
@@ -3373,12 +3426,16 @@ impl eframe::App for VisualizerApp {
         // ── Pick up config edits made in the settings window ──
         let generation = self.config_gen.load(Ordering::Acquire);
         if generation != self.seen_gen {
-            self.seen_gen = generation;
-            let mut st = lock_state(&self.shared);
-            self.config = st.config.clone();
-            if st.audio_dirty || self.config.audio != *self.audio_settings.load_full() {
-                self.audio_settings.store(Arc::new(self.config.audio.clone()));
-                st.audio_dirty = false;
+            // try_lock: never stall the overlay while the settings UI is mid-frame.
+            if let Some(mut st) = try_lock_state(&self.shared) {
+                self.seen_gen = generation;
+                self.config = st.config.clone();
+                if st.audio_dirty || self.config.audio != *self.audio_settings.load_full() {
+                    self.audio_settings.store(Arc::new(self.config.audio.clone()));
+                    st.audio_dirty = false;
+                }
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(4));
             }
         }
 
@@ -3389,11 +3446,24 @@ impl eframe::App for VisualizerApp {
             self.update_palettes();
             self.last_palette_hash = new_hash;
             // Mirror to the settings window (used for its colour previews).
-            let mut st = lock_state(&self.shared);
-            st.active_palettes = self.active_palettes.clone();
-            drop(st);
+            if let Some(mut st) = try_lock_state(&self.shared) {
+                st.active_palettes = self.active_palettes.clone();
+                self.palette_mirrored = true;
+            } else {
+                self.palette_mirrored = false;
+                ctx.request_repaint_after(std::time::Duration::from_millis(4));
+            }
             if self.settings_open.load(Ordering::Relaxed) {
                 ctx.request_repaint_of(egui::ViewportId::from_hash_of("settings"));
+            }
+        }
+
+        if !self.palette_mirrored {
+            if let Some(mut st) = try_lock_state(&self.shared) {
+                st.active_palettes = self.active_palettes.clone();
+                self.palette_mirrored = true;
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(4));
             }
         }
 
@@ -3491,7 +3561,25 @@ impl eframe::App for VisualizerApp {
         let moving = self.current_bars.iter().any(|&v| v > 0.0005)
             || self.current_peaks.iter().any(|&v| v > 0.0005);
         if moving {
-            ctx.request_repaint();
+            // While animating, the overlay drives its own repaints so the FPS
+            // cap is honoured; audio threads stay quiet (see `ui_active`).
+            self.ui_active.store(true, Ordering::Release);
+            let fps = self.config.max_fps.clamp(15, 60);
+            if fps >= 60 {
+                // VSync (60 Hz) paces this.
+                ctx.request_repaint_of(egui::ViewportId::ROOT);
+            } else {
+                let target = std::time::Duration::from_secs_f32(1.0 / fps as f32);
+                // This closure runs inside the ROOT pass, so this targets ROOT.
+                ctx.request_repaint_after(target.saturating_sub(now.elapsed()));
+            }
+        } else {
+            self.ui_active.store(false, Ordering::Release);
+            // A frame may have arrived between draining the channel and the
+            // store above; make sure it isn't left unseen.
+            if !self.audio_rx.is_empty() {
+                wake_root(ctx);
+            }
         }
     }
 
