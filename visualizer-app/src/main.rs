@@ -566,6 +566,9 @@ struct VisualizerApp {
     was_settings_open: bool,
     settings_icon: egui::IconData,
     ui_cmd_rx: crossbeam_channel::Receiver<UiCmd>,
+    /// true  → the GPU swap (VSync) paces the overlay; we re-request frames.
+    /// false → `--no-vsync`: frames are paced by the audio thread (60 Hz).
+    vsync: bool,
 
     // system
     _tray_icon: TrayIcon,
@@ -573,7 +576,7 @@ struct VisualizerApp {
 }
 
 impl VisualizerApp {
-    fn new(ctx: egui::Context) -> Self {
+    fn new(ctx: egui::Context, vsync: bool) -> Self {
         let config = AppConfig::load();
 
         // Audio thread wakes the UI whenever it publishes a frame.
@@ -699,6 +702,7 @@ impl VisualizerApp {
             was_settings_open: false,
             settings_icon: egui_icon,
             ui_cmd_rx,
+            vsync,
             _tray_icon: tray_icon,
             _hotkey_manager: hotkey_manager,
         }
@@ -3322,10 +3326,22 @@ fn run_settings_viewport(
             });
     }
 
-    // Did this frame change anything the overlay cares about?
-    let fp = config_fingerprint(&st.config);
-    let changed = st.audio_dirty || fp != st.last_fingerprint;
-    st.last_fingerprint = fp;
+    // Did this frame change anything the overlay cares about? Hover-only
+    // frames (mouse moving over the window, no click/drag/key/scroll) cannot
+    // change the config, so skip the (relatively expensive) comparison there.
+    let interacted = ctx.input(|i| {
+        i.pointer.any_down()
+            || i.events.iter().any(|e| !matches!(
+                e,
+                egui::Event::PointerMoved(_) | egui::Event::PointerGone | egui::Event::WindowFocused(_)
+            ))
+    });
+    let mut changed = st.audio_dirty;
+    if interacted || changed {
+        let fp = config_fingerprint(&st.config);
+        if fp != st.last_fingerprint { changed = true; }
+        st.last_fingerprint = fp;
+    }
     let wants_close = st.close_requested;
     st.close_requested = false;
     drop(st);
@@ -3494,7 +3510,7 @@ impl eframe::App for VisualizerApp {
         // events and settings edits (all call request_repaint themselves).
         let moving = self.current_bars.iter().any(|&v| v > 0.0005)
             || self.current_peaks.iter().any(|&v| v > 0.0005);
-        if moving {
+        if moving && self.vsync {
             ctx.request_repaint();
         }
     }
@@ -3508,6 +3524,10 @@ impl eframe::App for VisualizerApp {
 
 fn main() -> eframe::Result<()> {
     let (egui_icon, _) = load_icon();
+    // `--no-vsync`: don't block on the GPU swap. Frames are then paced by the
+    // audio thread instead. Useful because two windows (overlay + settings)
+    // that both wait for VSync on one thread can halve each other's frame rate.
+    let vsync = !std::env::args().any(|a| a == "--no-vsync");
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -3516,12 +3536,12 @@ fn main() -> eframe::Result<()> {
             .with_always_on_top()
             .with_maximized(true)
             .with_icon(egui_icon),
-        vsync: true,
+        vsync,
         ..Default::default()
     };
     eframe::run_native(
         "Rust Visualizer",
         options,
-        Box::new(|cc| Box::new(VisualizerApp::new(cc.egui_ctx.clone()))),
+        Box::new(move |cc| Box::new(VisualizerApp::new(cc.egui_ctx.clone(), vsync))),
     )
 }
