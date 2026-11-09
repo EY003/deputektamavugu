@@ -35,7 +35,12 @@ pub struct AudioEngine {
 }
 
 impl AudioEngine {
-    pub fn new(initial: AudioSettings) -> Self {
+    /// `on_frame` is invoked from the analysis thread whenever a new frame was
+    /// published. The UI uses it to wake itself up from idle (no polling).
+    pub fn new<F>(initial: AudioSettings, on_frame: F) -> Self
+    where
+        F: Fn() + Send + 'static,
+    {
         let settings = Arc::new(ArcSwap::from_pointee(initial));
 
         let (frame_tx, frame_rx) = crossbeam_channel::bounded(2);
@@ -53,7 +58,7 @@ impl AudioEngine {
 
         let settings_for_analysis = settings.clone();
         thread::spawn(move || {
-            analysis_loop(settings_for_analysis, sample_rx, frame_tx, sample_rate);
+            analysis_loop(settings_for_analysis, sample_rx, frame_tx, sample_rate, on_frame);
         });
 
         drop(capture_handle);
@@ -62,7 +67,7 @@ impl AudioEngine {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Capture thread (unchanged apart from channel mix read)
+// Capture thread — fully event driven (no polling, no 1 ms sleeps)
 // ─────────────────────────────────────────────────────────────
 
 fn capture_loop(
@@ -112,7 +117,10 @@ fn capture_loop(
         return;
     }
 
-    let _h_event = audio_client.set_get_eventhandle().ok();
+    let h_event = match audio_client.set_get_eventhandle() {
+        Ok(h) => h,
+        Err(_) => { let _ = info_tx.send((device_name, sample_rate)); return; }
+    };
     let capture_client = match audio_client.get_audiocaptureclient() {
         Ok(c) => c,
         Err(_) => { let _ = info_tx.send((device_name, sample_rate)); return; }
@@ -128,48 +136,55 @@ fn capture_loop(
     let mut mono: Vec<f32> = Vec::with_capacity(4096);
 
     loop {
-        let mut packet_size = 0u32;
-        for _ in 0..2000 {
-            packet_size = capture_client.get_next_nbr_frames().ok().flatten().unwrap_or(0);
-            if packet_size > 0 { break; }
-            thread::sleep(Duration::from_millis(1));
+        // Sleep inside the kernel until WASAPI signals new data. In loopback
+        // mode nothing is signalled while no application is playing, so this
+        // thread costs ~0 % when idle (it only wakes 4x/s on the timeout).
+        let waited_at = Instant::now();
+        if h_event.wait_for_event(250).is_err() && waited_at.elapsed() < Duration::from_millis(20) {
+            // The wait failed instantly (device lost?) — never busy-loop.
+            thread::sleep(Duration::from_millis(100));
         }
-        if packet_size == 0 { continue; }
 
-        let needed = packet_size as usize * samples_per_frame;
-        sample_buffer.resize(needed, 0.0);
-        let byte_slice: &mut [u8] = unsafe {
-            std::slice::from_raw_parts_mut(
-                sample_buffer.as_mut_ptr() as *mut u8,
-                needed * std::mem::size_of::<f32>(),
-            )
-        };
-        let (frames_read, _) = capture_client.read_from_device(byte_slice).unwrap_or((0, BufferFlags::none()));
-        if frames_read == 0 { continue; }
+        // Drain every packet that is currently available.
+        loop {
+            let packet_size = capture_client.get_next_nbr_frames().ok().flatten().unwrap_or(0);
+            if packet_size == 0 { break; }
 
-        let valid_samples = (frames_read as usize * samples_per_frame).min(sample_buffer.len());
-        let samples = &sample_buffer[..valid_samples];
+            let needed = packet_size as usize * samples_per_frame;
+            sample_buffer.resize(needed, 0.0);
+            let byte_slice: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    sample_buffer.as_mut_ptr() as *mut u8,
+                    needed * std::mem::size_of::<f32>(),
+                )
+            };
+            let (frames_read, _) = capture_client.read_from_device(byte_slice).unwrap_or((0, BufferFlags::none()));
+            if frames_read == 0 { break; }
 
-        let mix_mode = settings.load().channel_mix;
-        mono.clear();
-        mono.reserve(valid_samples / channels.max(1));
-        for chunk in samples.chunks_exact(channels.max(1)) {
-            if channels >= 2 {
-                let l = chunk[0];
-                let r = chunk[1];
-                let val = match mix_mode {
-                    ChannelMixMode::Mono | ChannelMixMode::Mid => (l + r) * 0.5,
-                    ChannelMixMode::Left => l,
-                    ChannelMixMode::Right => r,
-                    ChannelMixMode::Side => (l - r) * 0.5,
-                };
-                mono.push(val);
-            } else {
-                mono.push(chunk[0]);
+            let valid_samples = (frames_read as usize * samples_per_frame).min(sample_buffer.len());
+            let samples = &sample_buffer[..valid_samples];
+
+            let mix_mode = settings.load().channel_mix;
+            mono.clear();
+            mono.reserve(valid_samples / channels.max(1));
+            for chunk in samples.chunks_exact(channels.max(1)) {
+                if channels >= 2 {
+                    let l = chunk[0];
+                    let r = chunk[1];
+                    let val = match mix_mode {
+                        ChannelMixMode::Mono | ChannelMixMode::Mid => (l + r) * 0.5,
+                        ChannelMixMode::Left => l,
+                        ChannelMixMode::Right => r,
+                        ChannelMixMode::Side => (l - r) * 0.5,
+                    };
+                    mono.push(val);
+                } else {
+                    mono.push(chunk[0]);
+                }
             }
+            if mono.is_empty() { continue; }
+            if sample_tx.send(mono.clone()).is_err() { return; }
         }
-        if mono.is_empty() { continue; }
-        if sample_tx.send(mono.clone()).is_err() { return; }
     }
 }
 
@@ -177,40 +192,94 @@ fn capture_loop(
 // Analysis thread
 // ─────────────────────────────────────────────────────────────
 
-fn analysis_loop(
+/// Peak absolute sample value above which a chunk counts as "real audio".
+const LOUD_THRESHOLD: f32 = 1.0e-4;
+/// How long the input must be quiet (and the bars decayed) before we go idle.
+const IDLE_AFTER: Duration = Duration::from_millis(700);
+
+fn peak_abs(chunk: &[f32]) -> f32 {
+    chunk.iter().fold(0.0f32, |m, &s| m.max(s.abs()))
+}
+
+struct DcBlocker { alpha: f32, x: f32, y: f32 }
+impl DcBlocker {
+    fn new(sample_rate: f32) -> Self {
+        // ~10 Hz cutoff at the current sample rate.
+        let rc = 1.0 / (2.0 * std::f32::consts::PI * 10.0);
+        let dt = 1.0 / sample_rate.max(1.0);
+        Self { alpha: rc / (rc + dt), x: 0.0, y: 0.0 }
+    }
+    fn apply(&mut self, chunk: &mut [f32]) {
+        for s in chunk.iter_mut() {
+            let y = self.alpha * (self.y + *s - self.x);
+            self.x = *s;
+            self.y = y;
+            *s = y;
+        }
+    }
+}
+
+fn analysis_loop<F: Fn() + Send + 'static>(
     settings: Arc<ArcSwap<AudioSettings>>,
     sample_rx: Receiver<Vec<f32>>,
     frame_tx: Sender<BarFrame>,
     sample_rate: f32,
+    on_frame: F,
 ) {
     let mut processor = AudioProcessor::new(sample_rate);
     let mut history: Vec<f32> = Vec::with_capacity(16_384);
-    let mut last_tick = Instant::now();
+    let mut dc = DcBlocker::new(sample_rate);
+    // Spin only for the last 0.5 ms of each period instead of burning a core.
+    let sleeper = spin_sleep::SpinSleeper::new(500_000);
 
-    // One-pole DC blocker state
-    let mut dc_x = 0.0f32;
-    let mut dc_y = 0.0f32;
-    // Coefficient for ~10 Hz cutoff at the current sample rate.
-    let dc_alpha = {
-        let rc = 1.0 / (2.0 * std::f32::consts::PI * 10.0);
-        let dt = 1.0 / sample_rate.max(1.0);
-        rc / (rc + dt)
-    };
+    let mut last_tick = Instant::now();
+    let mut last_loud = Instant::now();
+    let mut last_chunk = Instant::now();
+    let mut idle = false;
+    let mut last_sent_zero = false;
 
     loop {
         let current = settings.load_full();
+
+        // ── Deep idle: block until REAL audio arrives. 0 % CPU. ────────
+        if idle {
+            let mut chunk = match sample_rx.recv() {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            if peak_abs(&chunk) <= LOUD_THRESHOLD {
+                continue; // digital silence is still streaming; stay asleep
+            }
+            idle = false;
+            let now = Instant::now();
+            last_loud = now;
+            last_chunk = now;
+            last_tick = now;
+            if current.dc_block { dc.apply(&mut chunk); }
+            history.extend_from_slice(&chunk);
+        }
+
         let poll_period = Duration::from_secs_f32(1.0 / current.poll_rate_hz.max(1.0));
 
+        // ── Ingest whatever the capture thread produced ────────────────
+        let mut got_chunk = false;
         while let Ok(mut chunk) = sample_rx.try_recv() {
-            if current.dc_block {
-                for s in chunk.iter_mut() {
-                    let y = dc_alpha * (dc_y + *s - dc_x);
-                    dc_x = *s;
-                    dc_y = y;
-                    *s = y;
-                }
-            }
+            got_chunk = true;
+            if peak_abs(&chunk) > LOUD_THRESHOLD { last_loud = Instant::now(); }
+            if current.dc_block { dc.apply(&mut chunk); }
             history.extend_from_slice(&chunk);
+        }
+        if got_chunk { last_chunk = Instant::now(); }
+
+        let dt_raw = last_tick.elapsed().as_secs_f32();
+        let dt = dt_raw.clamp(0.001, 0.2);
+        last_tick = Instant::now();
+
+        // WASAPI loopback delivers NO packets while nothing is playing. Feed
+        // zeros so the bars decay smoothly instead of freezing on stale data.
+        if !got_chunk && last_chunk.elapsed() > Duration::from_millis(60) {
+            let n = ((dt_raw * sample_rate) as usize).min(16_384);
+            history.resize(history.len() + n, 0.0);
         }
 
         let cap = (current.fft_size * 4).max(8192);
@@ -219,16 +288,38 @@ fn analysis_loop(
             history.drain(0..drop_n);
         }
 
-        let dt = last_tick.elapsed().as_secs_f32().clamp(0.001, 0.2);
-        last_tick = Instant::now();
-
+        // ── Analyse + publish ──────────────────────────────────────────
         if let Some(frame) = processor.process(&history, &current, dt) {
-            let _ = frame_tx.try_send(frame);
+            let is_zero = frame.values.iter().all(|&v| v == 0.0)
+                && frame.peaks.iter().all(|&v| v == 0.0);
+            // Don't wake the UI to redraw an identical empty frame.
+            if !(is_zero && last_sent_zero) {
+                if frame_tx.try_send(frame).is_ok() {
+                    last_sent_zero = is_zero;
+                    on_frame();
+                }
+            }
+        }
+
+        // ── Enter deep idle once silent and fully decayed ──────────────
+        if last_loud.elapsed() > IDLE_AFTER && processor.is_silent() {
+            processor.snap_to_silence();
+            let frame = processor.silent_frame();
+            // Make sure the UI sees the final all-zero frame (it must not be
+            // dropped, or stale bars would stay on screen forever).
+            on_frame();
+            let _ = frame_tx.send_timeout(frame, Duration::from_millis(200));
+            on_frame();
+            last_sent_zero = true;
+            history.clear();
+            history.resize(current.fft_size, 0.0);
+            idle = true;
+            continue;
         }
 
         let elapsed = last_tick.elapsed();
         if elapsed < poll_period {
-            spin_sleep::sleep(poll_period - elapsed);
+            sleeper.sleep(poll_period - elapsed);
         }
     }
 }
@@ -346,6 +437,35 @@ impl AudioProcessor {
                                               self.sample_rate, s.min_frequency_hz, s.max_frequency_hz);
             self.bin_centers_hz = centers_from_ranges(&self.bin_ranges, s.fft_size, self.sample_rate);
             self.resize_bar_state(s.num_bars);
+        }
+    }
+
+    /// True when every bar/peak has decayed to (almost) nothing.
+    fn is_silent(&self) -> bool {
+        self.bar_values.iter().all(|&v| v < 1.0e-3)
+            && self.bar_peaks.iter().all(|&v| v < 1.0e-3)
+            && self.beat_envelope < 1.0e-3
+    }
+
+    /// Hard-reset all decaying state to exact zero.
+    fn snap_to_silence(&mut self) {
+        for v in self.bar_values.iter_mut() { *v = 0.0; }
+        for v in self.bar_peaks.iter_mut() { *v = 0.0; }
+        for v in self.bar_velocities.iter_mut() { *v = 0.0; }
+        for v in self.peak_hold_remaining.iter_mut() { *v = 0.0; }
+        self.frame_history.clear();
+        self.beat_energy_history.clear();
+        self.beat_envelope = 0.0;
+    }
+
+    fn silent_frame(&self) -> BarFrame {
+        BarFrame {
+            values: vec![0.0; self.bar_values.len()],
+            peaks: vec![0.0; self.bar_peaks.len()],
+            beat: false,
+            beat_envelope: 0.0,
+            bpm: self.bpm,
+            phase: self.phase,
         }
     }
 
