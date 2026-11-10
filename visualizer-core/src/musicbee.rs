@@ -35,7 +35,7 @@ pub fn spawn_smtc_listener<F>(
     session_count: Arc<AtomicUsize>,
     on_update: F,
 ) where
-    F: Fn() + Send + 'static,
+    F: Fn() + Send + Sync + 'static,
 {
     std::thread::spawn(move || {
         unsafe {
