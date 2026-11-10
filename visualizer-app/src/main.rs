@@ -606,6 +606,7 @@ struct VisualizerApp {
     config: AppConfig,
     current_bars: Vec<f32>,
     current_peaks: Vec<f32>,
+    smoothed_max_val: f32,
     last_bpm: f32,
     audio_rx: crossbeam_channel::Receiver<BarFrame>,
     audio_settings: Arc<ArcSwap<visualizer_core::config::AudioSettings>>,
@@ -740,6 +741,7 @@ impl VisualizerApp {
         Self {
             current_bars: vec![0.0; num_bars],
             current_peaks: vec![0.0; num_bars],
+            smoothed_max_val: 0.0,
             last_bpm: 0.0,
             audio_rx: engine.frame_rx,
             audio_settings,
@@ -785,23 +787,21 @@ impl VisualizerApp {
 
     // ── Overlay geometry ──────────────────────────────────────
 
-    fn compute_overlay_rect(&self, ctx: &egui::Context, monitor: egui::Rect) -> egui::Rect {
+    fn compute_bars_rect(&self, monitor: egui::Rect) -> egui::Rect {
         let n_bars = self.visual_num_bars().max(1);
         let stride = self.config.bar_width + self.config.bar_gap;
         let bars_extent = (n_bars as f32 * stride - self.config.bar_gap).max(1.0);
 
         let rect_len = match self.config.visualizer_direction {
-            VisualizerDirection::Up | VisualizerDirection::Down => {
-                monitor.height() * self.config.height_scale
-            }
-            VisualizerDirection::Left | VisualizerDirection::Right => {
-                monitor.width() * self.config.height_scale
-            }
+            VisualizerDirection::Up | VisualizerDirection::Down => monitor.height() * self.config.height_scale,
+            VisualizerDirection::Left | VisualizerDirection::Right => monitor.width() * self.config.height_scale,
         };
-        let max_bar_h = if self.config.max_bar_height > 0.0 {
+        
+        let max_h_drawn = if self.config.max_bar_height > 0.0 {
             self.config.max_bar_height.min(rect_len)
         } else {
-            rect_len
+            // Use smoothed max value to shrink empty space above bars
+            (self.smoothed_max_val * rect_len).max(rect_len * 0.15)
         };
 
         let cx = monitor.center().x + self.config.x_offset;
@@ -809,110 +809,80 @@ impl VisualizerApp {
 
         let bars_rect = match self.config.visualizer_direction {
             VisualizerDirection::Up => egui::Rect::from_min_max(
-                egui::pos2(
-                    cx - bars_extent / 2.0,
-                    monitor.bottom() + self.config.y_offset - max_bar_h,
-                ),
+                egui::pos2(cx - bars_extent / 2.0, monitor.bottom() + self.config.y_offset - max_h_drawn),
                 egui::pos2(cx + bars_extent / 2.0, monitor.bottom() + self.config.y_offset),
             ),
             VisualizerDirection::Down => egui::Rect::from_min_max(
                 egui::pos2(cx - bars_extent / 2.0, monitor.top() + self.config.y_offset),
-                egui::pos2(cx + bars_extent / 2.0, monitor.top() + self.config.y_offset + max_bar_h),
+                egui::pos2(cx + bars_extent / 2.0, monitor.top() + self.config.y_offset + max_h_drawn),
             ),
             VisualizerDirection::Right => egui::Rect::from_min_max(
                 egui::pos2(monitor.left() + self.config.x_offset, cy - bars_extent / 2.0),
-                egui::pos2(
-                    monitor.left() + self.config.x_offset + max_bar_h,
-                    cy + bars_extent / 2.0,
-                ),
+                egui::pos2(monitor.left() + self.config.x_offset + max_h_drawn, cy + bars_extent / 2.0),
             ),
             VisualizerDirection::Left => egui::Rect::from_min_max(
-                egui::pos2(
-                    monitor.right() + self.config.x_offset - max_bar_h,
-                    cy - bars_extent / 2.0,
-                ),
+                egui::pos2(monitor.right() + self.config.x_offset - max_h_drawn, cy - bars_extent / 2.0),
                 egui::pos2(monitor.right() + self.config.x_offset, cy + bars_extent / 2.0),
             ),
         };
 
-        let mut bbox = bars_rect;
+        let pad = 20.0;
+        let bbox = bars_rect.expand(pad);
+        let min = egui::vec2(100.0, 100.0);
+        let size = bbox.size().max(min);
+        egui::Rect::from_center_size(bbox.center(), size)
+    }
 
+    fn compute_track_info_rect(&self, ctx: &egui::Context, monitor: egui::Rect) -> egui::Rect {
         let cfg = &self.config.track_info;
         let show_art = cfg.show_cover_art && self.cover_texture.is_some();
         let has_track = self.track_info.is_some();
         let show_text = has_track && (cfg.show_title || cfg.show_artist);
 
-        if has_track && (show_art || show_text) {
-            let margin = 40.0;
-            let art_size = if show_art { cfg.cover_size } else { 0.0 };
-            let art_x = monitor.right() - margin - art_size + cfg.cover_x_offset;
-            let art_y = monitor.top() + margin + cfg.cover_y_offset;
-
-            if show_art {
-                let art_rect = egui::Rect::from_min_size(
-                    egui::pos2(art_x, art_y),
-                    egui::vec2(art_size, art_size),
-                );
-                bbox = bbox.union(art_rect);
-            }
-
-            if show_text {
-                let text_x = monitor.right() - margin + cfg.text_x_offset;
-                let mut text_y = monitor.top() + margin + cfg.text_y_offset;
-                if show_art {
-                    text_y += art_size + 14.0;
-                }
-                
-                let info = self.track_info.as_ref().unwrap();
-                let family = if cfg.font_path.is_some() { custom_font_family() } else { egui::FontFamily::Proportional };
-                let artist_font = egui::FontId::new(cfg.artist_font_size, family.clone());
-                let title_font = egui::FontId::new(cfg.title_font_size, family);
-
-                // Accurately measure the text width so the bounding box is tight!
-                let artist_w = if cfg.show_artist && !info.artist.is_empty() {
-                    ctx.fonts(|f| f.layout_no_wrap(info.artist.clone(), artist_font.clone(), egui::Color32::WHITE).size().x)
-                } else { 0.0 };
-                let title_w = if cfg.show_title && !info.title.is_empty() {
-                    ctx.fonts(|f| f.layout_no_wrap(info.title.clone(), title_font, egui::Color32::WHITE).size().x)
-                } else { 0.0 };
-
-                let max_w = artist_w.max(title_w).max(50.0);
-                let est_h = (cfg.title_font_size + cfg.artist_font_size) * cfg.line_height.max(1.0) + 20.0;
-
-                let text_rect = match cfg.alignment {
-                    TrackTextAlign::Right => egui::Rect::from_min_max(
-                        egui::pos2(text_x - max_w, text_y),
-                        egui::pos2(text_x, text_y + est_h),
-                    ),
-                    TrackTextAlign::Left => egui::Rect::from_min_max(
-                        egui::pos2(text_x, text_y),
-                        egui::pos2(text_x + max_w, text_y + est_h),
-                    ),
-                    TrackTextAlign::Center => egui::Rect::from_min_max(
-                        egui::pos2(text_x - max_w / 2.0, text_y),
-                        egui::pos2(text_x + max_w / 2.0, text_y + est_h),
-                    ),
-                };
-                bbox = bbox.union(text_rect);
-            }
+        if !(has_track && (show_art || show_text)) {
+            return egui::Rect::NOTHING;
         }
 
-        if self.config.show_fps {
-            let fps_rect = egui::Rect::from_min_size(
-                monitor.left_top() + egui::vec2(20.0, 20.0),
-                egui::vec2(160.0, 30.0),
-            );
-            bbox = bbox.union(fps_rect);
+        let margin = 40.0;
+        let art_size = if show_art { cfg.cover_size } else { 0.0 };
+        let art_x = monitor.right() - margin - art_size + cfg.cover_x_offset;
+        let art_y = monitor.top() + margin + cfg.cover_y_offset;
+
+        let info = self.track_info.as_ref().unwrap();
+        let family = if cfg.font_path.is_some() { custom_font_family() } else { egui::FontFamily::Proportional };
+        let artist_font = egui::FontId::new(cfg.artist_font_size, family.clone());
+        let title_font = egui::FontId::new(cfg.title_font_size, family);
+
+        let artist_w = if cfg.show_artist && !info.artist.is_empty() {
+            ctx.fonts(|f| f.layout_no_wrap(info.artist.clone(), artist_font.clone(), egui::Color32::WHITE).size().x)
+        } else { 0.0 };
+        let title_w = if cfg.show_title && !info.title.is_empty() {
+            ctx.fonts(|f| f.layout_no_wrap(info.title.clone(), title_font, egui::Color32::WHITE).size().x)
+        } else { 0.0 };
+
+        let max_w = artist_w.max(title_w).max(10.0);
+        let est_h = (cfg.title_font_size + cfg.artist_font_size) * cfg.line_height.max(1.0) + 20.0;
+
+        let text_x = monitor.right() - margin + cfg.text_x_offset;
+        let mut text_y = monitor.top() + margin + cfg.text_y_offset;
+        if show_art {
+            text_y += art_size + 14.0;
         }
 
-        let pad = 32.0;
-        let bbox = bbox.expand(pad);
+        let text_rect = match cfg.alignment {
+            TrackTextAlign::Right => egui::Rect::from_min_max(egui::pos2(text_x - max_w, text_y), egui::pos2(text_x + 10.0, text_y + est_h)),
+            TrackTextAlign::Left => egui::Rect::from_min_max(egui::pos2(text_x - 10.0, text_y), egui::pos2(text_x + max_w, text_y + est_h)),
+            TrackTextAlign::Center => egui::Rect::from_min_max(egui::pos2(text_x - max_w/2.0 - 10.0, text_y), egui::pos2(text_x + max_w/2.0 + 10.0, text_y + est_h)),
+        };
 
-        let min = egui::vec2(80.0, 60.0);
-        let size = bbox.size().max(min);
-        let center = bbox.center();
-        // Do NOT intersect with monitor here, otherwise things get clipped when Mirrored is wide.
-        egui::Rect::from_center_size(center, size)
+        let mut bbox = text_rect;
+        if show_art {
+            let art_rect = egui::Rect::from_min_size(egui::pos2(art_x, art_y), egui::vec2(art_size, art_size));
+            bbox = bbox.union(art_rect);
+        }
+
+        let pad = 20.0;
+        bbox.expand(pad)
     }
 
     // ── Palette updates ───────────────────────────────────────
@@ -1544,7 +1514,7 @@ impl VisualizerApp {
         draw_spaced(ctx, painter, text, pos, font_id, align, color, ls);
     }
 
-    fn draw_track_info(
+    fn draw_track_info_internal(
         &self,
         painter: &egui::Painter,
         ctx: &egui::Context,
@@ -4284,21 +4254,30 @@ impl eframe::App for VisualizerApp {
             self.last_bpm = frame.bpm;
         }
 
+        // Calculate smoothed max bar value to tightly fit the window
+        let mut max_val = 0.0f32;
+        for i in 0..self.current_bars.len() {
+            max_val = max_val.max(self.current_bars[i]);
+        }
+        if max_val > self.smoothed_max_val {
+            self.smoothed_max_val = max_val;
+        } else {
+            self.smoothed_max_val = (self.smoothed_max_val - dt * 0.3).max(max_val).max(0.1);
+        }
+
         if !self.is_passthrough_set {
             ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
             self.is_passthrough_set = true;
         }
 
-        // Get the accurate monitor size directly from the viewport info
         let monitor_size = ctx.input(|i| i.viewport().monitor_size).unwrap_or(egui::vec2(1920.0, 1080.0));
         let monitor = egui::Rect::from_min_size(egui::Pos2::ZERO, monitor_size);
 
-        let target = self.compute_overlay_rect(ctx, monitor);
-
+        // ── 1. Draw Visualizer in the Main Window ─────────────
+        let target = self.compute_bars_rect(monitor);
         let actual_pos = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min)).unwrap_or(egui::Pos2::ZERO);
         let actual_size = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size())).unwrap_or(egui::Vec2::ZERO);
 
-        // Send commands if the actual window differs from the target.
         if (actual_size - target.size()).length() > 1.0 || (actual_pos - target.min).length() > 1.0 {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target.size()));
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target.min));
@@ -4319,7 +4298,6 @@ impl eframe::App for VisualizerApp {
         }
 
         self.draw_bars(&painter, ctx, monitor, overlay_origin);
-        self.draw_track_info(&painter, ctx, overlay_origin, monitor);
 
         if self.config.show_fps {
             let world_pos = monitor.left_top() + egui::vec2(20.0, 20.0);
@@ -4333,6 +4311,51 @@ impl eframe::App for VisualizerApp {
             );
         }
 
+        // ── 2. Draw Track Info in a Separate Window ────────────
+        let info_id = egui::ViewportId::from_hash_of("track_info");
+        let cfg = &self.config.track_info;
+        let show_art = cfg.show_cover_art && self.cover_texture.is_some();
+        let has_track = self.track_info.is_some();
+        let show_text = has_track && (cfg.show_title || cfg.show_artist);
+
+        if has_track && (show_art || show_text) {
+            let bbox = self.compute_track_info_rect(ctx, monitor);
+            if bbox != egui::Rect::NOTHING {
+                let mut builder = egui::ViewportBuilder::default()
+                    .with_title("Track Info")
+                    .with_transparent(true)
+                    .with_decorations(false)
+                    .with_always_on_top()
+                    .with_inner_size(bbox.size())
+                    .with_position(bbox.min);
+
+                if self.settings_icon.width > 0 {
+                    builder = builder.with_icon(self.settings_icon.clone());
+                }
+
+                ctx.show_viewport_immediate(info_id, builder, |ctx, _class| {
+                    if ctx.input(|i| i.viewport().close_requested()) {
+                        return;
+                    }
+                    ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
+                    
+                    let local_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, bbox.size());
+                    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("track_info_overlay")));
+
+                    if self.config.bg_opacity > 0 {
+                        let c = self.config.bg_color;
+                        let bg_color = egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], self.config.bg_opacity);
+                        painter.rect_filled(local_rect, 0.0, bg_color);
+                    }
+
+                    self.draw_track_info_internal(&painter, ctx, bbox.min, monitor);
+                });
+            }
+        } else {
+            ctx.send_viewport_cmd_to(info_id, egui::ViewportCommand::Close);
+        }
+
+        // ── 3. Settings viewport ───────────────────────────────
         let open = self.settings_open.load(Ordering::Relaxed);
         let settings_id = egui::ViewportId::from_hash_of("settings");
         if open {
