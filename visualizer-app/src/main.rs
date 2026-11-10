@@ -5,7 +5,7 @@ use image::DynamicImage;
 use std::f32::consts::TAU;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use visualizer_core::{
     audio::{AudioEngine, BarFrame},
@@ -577,6 +577,9 @@ struct SettingsState {
     last_bpm: f32,
     current_fps: f32,
     system_fonts: Vec<(String, String)>,
+    /// Wall-clock time of the last settings-viewport paint, used to throttle
+    /// pointer-move-only repaints. Drags/clicks/keys/wheel are never throttled.
+    last_paint_time: Option<Instant>,
 }
 
 fn lock_state(m: &Mutex<SettingsState>) -> std::sync::MutexGuard<'_, SettingsState> {
@@ -627,6 +630,11 @@ struct VisualizerApp {
     last_palette_hash: u64,
     loaded_font_path: Option<String>,
     smtc_session_count: Arc<AtomicUsize>,
+
+    // Overlay rect cache — avoids recomputing `compute_overlay_rect` (which
+    // does costly text measurement) on every single main-viewport frame.
+    overlay_cache_key: Option<u64>,
+    overlay_cache_rect: egui::Rect,
 
     shared: Arc<Mutex<SettingsState>>,
     settings_open: Arc<AtomicBool>,
@@ -736,6 +744,7 @@ impl VisualizerApp {
             last_bpm: 0.0,
             current_fps: 0.0,
             system_fonts: list_system_fonts(),
+            last_paint_time: None,
         }));
 
         Self {
@@ -749,7 +758,7 @@ impl VisualizerApp {
             current_fps: 0.0,
             is_passthrough_set: false,
             last_frame_time: Instant::now(),
-            last_viewport_cmd_time: Instant::now() - std::time::Duration::from_secs(1),
+            last_viewport_cmd_time: Instant::now() - Duration::from_secs(1),
             track_rx,
             track_info: None,
             cover_texture: None,
@@ -763,6 +772,8 @@ impl VisualizerApp {
             last_palette_hash: 0,
             loaded_font_path: Some("__init__".to_string()),
             smtc_session_count,
+            overlay_cache_key: None,
+            overlay_cache_rect: egui::Rect::ZERO,
             shared,
             settings_open,
             config_gen: Arc::new(AtomicU64::new(0)),
@@ -786,6 +797,70 @@ impl VisualizerApp {
     }
 
     // ── Overlay geometry ──────────────────────────────────────
+
+    /// Cheap key covering every input to `compute_overlay_rect`. If this
+    /// matches the previous frame, we reuse the cached rect and skip the
+    /// expensive `layout_no_wrap` text measurements entirely.
+    fn overlay_key(&self, monitor: egui::Rect) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+
+        // Monitor geometry
+        monitor.min.x.to_bits().hash(&mut h);
+        monitor.min.y.to_bits().hash(&mut h);
+        monitor.max.x.to_bits().hash(&mut h);
+        monitor.max.y.to_bits().hash(&mut h);
+
+        // Bar layout
+        self.config.bar_width.to_bits().hash(&mut h);
+        self.config.bar_gap.to_bits().hash(&mut h);
+        self.config.height_scale.to_bits().hash(&mut h);
+        self.config.max_bar_height.to_bits().hash(&mut h);
+        self.config.x_offset.to_bits().hash(&mut h);
+        self.config.y_offset.to_bits().hash(&mut h);
+        self.config.audio.num_bars.hash(&mut h);
+        std::mem::discriminant(&self.config.visualizer_direction).hash(&mut h);
+        std::mem::discriminant(&self.config.frequency_direction).hash(&mut h);
+
+        // Track info config
+        let ti = &self.config.track_info;
+        ti.show_cover_art.hash(&mut h);
+        ti.cover_size.to_bits().hash(&mut h);
+        ti.cover_x_offset.to_bits().hash(&mut h);
+        ti.cover_y_offset.to_bits().hash(&mut h);
+        ti.show_title.hash(&mut h);
+        ti.show_artist.hash(&mut h);
+        ti.title_font_size.to_bits().hash(&mut h);
+        ti.artist_font_size.to_bits().hash(&mut h);
+        ti.line_height.to_bits().hash(&mut h);
+        ti.text_x_offset.to_bits().hash(&mut h);
+        ti.text_y_offset.to_bits().hash(&mut h);
+        std::mem::discriminant(&ti.alignment).hash(&mut h);
+        ti.font_path.hash(&mut h);
+
+        // Track text + cover presence
+        self.track_id.hash(&mut h);
+        self.cover_texture.is_some().hash(&mut h);
+        if let Some(info) = &self.track_info {
+            info.artist.hash(&mut h);
+            info.title.hash(&mut h);
+        }
+
+        self.config.show_fps.hash(&mut h);
+
+        h.finish()
+    }
+
+    fn compute_overlay_rect_cached(&mut self, ctx: &egui::Context, monitor: egui::Rect) -> egui::Rect {
+        let key = self.overlay_key(monitor);
+        if self.overlay_cache_key == Some(key) {
+            return self.overlay_cache_rect;
+        }
+        let rect = self.compute_overlay_rect(ctx, monitor);
+        self.overlay_cache_key = Some(key);
+        self.overlay_cache_rect = rect;
+        rect
+    }
 
     fn compute_overlay_rect(&self, ctx: &egui::Context, monitor: egui::Rect) -> egui::Rect {
         let n_bars = self.visual_num_bars().max(1);
@@ -864,13 +939,12 @@ impl VisualizerApp {
                 if show_art {
                     text_y += art_size + 14.0;
                 }
-                
+
                 let info = self.track_info.as_ref().unwrap();
                 let family = if cfg.font_path.is_some() { custom_font_family() } else { egui::FontFamily::Proportional };
                 let artist_font = egui::FontId::new(cfg.artist_font_size, family.clone());
                 let title_font = egui::FontId::new(cfg.title_font_size, family);
 
-                // Accurately measure the text width so the bounding box is tight!
                 let artist_w = if cfg.show_artist && !info.artist.is_empty() {
                     ctx.fonts(|f| f.layout_no_wrap(info.artist.clone(), artist_font.clone(), egui::Color32::WHITE).size().x)
                 } else { 0.0 };
@@ -913,7 +987,6 @@ impl VisualizerApp {
         let min = egui::vec2(80.0, 60.0);
         let size = bbox.size().max(min);
         let center = bbox.center();
-        // Do NOT intersect with monitor here, otherwise things get clipped when Mirrored is wide.
         egui::Rect::from_center_size(center, size)
     }
 
@@ -4148,6 +4221,38 @@ fn run_settings_viewport(
         )));
     }
 
+    // ── Throttle hover-only repaints ─────────────────────────
+    //
+    // A focused settings window receives a WM_MOUSEMOVE for every pixel the
+    // cursor travels. For a 1 kHz gaming mouse that's ~1000 repaint requests
+    // per second from this viewport. Because both viewports share the
+    // eframe event-loop thread and the GPU context, each extra settings paint
+    // delays the *main* viewport's paint. The main viewport has a heavier
+    // paint (overlay rect, mesh, track text) so the visible effect is that
+    // the visualizer bars stutter while the (cheap) settings window stays
+    // smooth.
+    //
+    // Pure hover updates are cosmetic — the hover highlight lagging ≤ 33 ms
+    // behind the cursor is imperceptible. Drags, clicks, wheel, and key
+    // events are NEVER throttled, and drag deltas accumulate across frames
+    // in egui so sliders still track correctly.
+    let now = Instant::now();
+    let (has_moves, has_non_move) = ctx.input(|i| {
+        let has_moves = i.events.iter().any(|e| matches!(e, egui::Event::PointerMoved(_)));
+        let has_non_move = i.events.iter().any(|e| !matches!(e, egui::Event::PointerMoved(_)));
+        (has_moves, has_non_move)
+    });
+    if has_moves && !has_non_move {
+        if let Some(last) = st.last_paint_time {
+            let since = now.duration_since(last);
+            if since < Duration::from_millis(33) {
+                ctx.request_repaint_after(Duration::from_millis(33) - since);
+                return;
+            }
+        }
+    }
+    st.last_paint_time = Some(now);
+
     egui::CentralPanel::default()
         .frame(egui::Frame::none().fill(egui::Color32::BLACK))
         .show(ctx, |ui| {
@@ -4182,12 +4287,8 @@ fn run_settings_viewport(
             });
     }
 
-    // Config only ever changes in response to real user input (clicks, drags,
-    // typing, wheel). Pure `PointerMoved` events cannot change config, and
-    // re-running the (expensive) `toml::to_string` fingerprint on every
-    // pointer-move frame keeps the shared event-loop thread busy, which in
-    // turn starves the ROOT viewport and makes the visualizer bars stutter
-    // while the mouse is moving over this window.
+    // Config only changes in response to real user input (clicks, drags,
+    // typing, wheel). Skip the expensive toml fingerprint on hover-only frames.
     let user_modified = ctx.input(|i| {
         i.pointer.any_down()
             || !i.keys_down.is_empty()
@@ -4310,27 +4411,22 @@ impl eframe::App for VisualizerApp {
             self.is_passthrough_set = true;
         }
 
-        // Get the accurate monitor size directly from the viewport info
         let monitor_size = ctx.input(|i| i.viewport().monitor_size).unwrap_or(egui::vec2(1920.0, 1080.0));
         let monitor = egui::Rect::from_min_size(egui::Pos2::ZERO, monitor_size);
 
-        let target = self.compute_overlay_rect(ctx, monitor);
+        // Cached overlay rect: skips the expensive text-shaping work in
+        // `compute_overlay_rect` when nothing that affects it has changed.
+        // This is the single biggest cost saver for the main viewport's paint
+        // path and lets each main paint fit comfortably in the frame budget
+        // even while the settings viewport is also painting on input.
+        let target = self.compute_overlay_rect_cached(ctx, monitor);
 
         let actual_pos = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min)).unwrap_or(egui::Pos2::ZERO);
         let actual_size = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size())).unwrap_or(egui::Vec2::ZERO);
 
-        // Only re-issue the resize/position when the OS window is meaningfully
-        // off target AND we haven't already asked for a correction very recently.
-        //
-        // Without the cooldown, a non-focused or deferred state can cause the
-        // OS to refuse (or round) the requested rect, in which case
-        // `actual != target` forever. That produces a per-frame
-        // `InnerSize`/`OuterPosition` storm that starves the event-loop thread
-        // and freezes the visualizer while the settings window has focus.
         let needs_correction = (actual_size - target.size()).length() > 2.0
             || (actual_pos - target.min).length() > 2.0;
-        let cooldown_ok = now.duration_since(self.last_viewport_cmd_time)
-            > std::time::Duration::from_millis(100);
+        let cooldown_ok = now.duration_since(self.last_viewport_cmd_time) > Duration::from_millis(100);
 
         if needs_correction && cooldown_ok {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target.size()));
