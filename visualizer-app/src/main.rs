@@ -4180,10 +4180,26 @@ fn run_settings_viewport(
             });
     }
 
-    let fp = config_fingerprint(&st.config);
-    let changed = st.audio_dirty || fp != st.last_fingerprint;
-    st.last_fingerprint = fp;
+        // Config only ever changes in response to user input.
+    // Recomputing the (expensive) toml fingerprint on every PointerMoved
+    // event from this viewport starves the ROOT viewport's update loop and
+    // makes the visualizer bars stutter while the mouse is moving.
+    let user_modified = ctx.input(|i| {
+        i.pointer.any_down()                               // slider drags, button held
+            || !i.keys_down.is_empty()                     // typing / holding a key
+            || i.events.iter().any(|e| {
+                !matches!(e, egui::Event::PointerMoved(_)) // clicks, wheel, text, etc.
+            })
+    });
 
+    let changed = if st.audio_dirty || user_modified {
+        let fp = config_fingerprint(&st.config);
+        let changed = st.audio_dirty || fp != st.last_fingerprint;
+        st.last_fingerprint = fp;
+        changed
+    } else {
+        false
+    };
     let wants_close = st.close_requested;
     st.close_requested = false;
     drop(st);
