@@ -640,6 +640,8 @@ struct VisualizerApp {
     _hotkey_manager: GlobalHotKeyManager,
 
     mesh: MeshBuilder,
+    last_bar_rect: egui::Rect,
+    last_info_rect: egui::Rect,
 }
 
 impl VisualizerApp {
@@ -741,7 +743,7 @@ impl VisualizerApp {
         Self {
             current_bars: vec![0.0; num_bars],
             current_peaks: vec![0.0; num_bars],
-            smoothed_max_val: 0.0,
+            smoothed_max_val: 0.1,
             last_bpm: 0.0,
             audio_rx: engine.frame_rx,
             audio_settings,
@@ -773,6 +775,8 @@ impl VisualizerApp {
             _tray_icon: tray_icon,
             _hotkey_manager: hotkey_manager,
             mesh: MeshBuilder::new(),
+            last_bar_rect: egui::Rect::NOTHING,
+            last_info_rect: egui::Rect::NOTHING,
         }
     }
 
@@ -800,8 +804,10 @@ impl VisualizerApp {
         let max_h_drawn = if self.config.max_bar_height > 0.0 {
             self.config.max_bar_height.min(rect_len)
         } else {
-            // Use smoothed max value to shrink empty space above bars
-            (self.smoothed_max_val * rect_len).max(rect_len * 0.15)
+            // Snap the height to 32px increments to prevent constant resizing/flickering
+            let target_h = (self.smoothed_max_val * rect_len).max(rect_len * 0.15);
+            let padded_h = (target_h + 32.0).min(rect_len);
+            (padded_h / 32.0).ceil() * 32.0
         };
 
         let cx = monitor.center().x + self.config.x_offset;
@@ -4262,7 +4268,7 @@ impl eframe::App for VisualizerApp {
         if max_val > self.smoothed_max_val {
             self.smoothed_max_val = max_val;
         } else {
-            self.smoothed_max_val = (self.smoothed_max_val - dt * 0.3).max(max_val).max(0.1);
+            self.smoothed_max_val = (self.smoothed_max_val - dt * 0.5).max(max_val).max(0.1);
         }
 
         if !self.is_passthrough_set {
@@ -4275,12 +4281,12 @@ impl eframe::App for VisualizerApp {
 
         // ── 1. Draw Visualizer in the Main Window ─────────────
         let target = self.compute_bars_rect(monitor);
-        let actual_pos = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min)).unwrap_or(egui::Pos2::ZERO);
-        let actual_size = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size())).unwrap_or(egui::Vec2::ZERO);
-
-        if (actual_size - target.size()).length() > 1.0 || (actual_pos - target.min).length() > 1.0 {
+        
+        // Only resize if the target changed (prevents flickering)
+        if target != self.last_bar_rect {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target.size()));
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target.min));
+            self.last_bar_rect = target;
         }
 
         let local_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, target.size());
@@ -4321,38 +4327,47 @@ impl eframe::App for VisualizerApp {
         if has_track && (show_art || show_text) {
             let bbox = self.compute_track_info_rect(ctx, monitor);
             if bbox != egui::Rect::NOTHING {
-                let mut builder = egui::ViewportBuilder::default()
-                    .with_title("Track Info")
-                    .with_transparent(true)
-                    .with_decorations(false)
-                    .with_always_on_top()
-                    .with_inner_size(bbox.size())
-                    .with_position(bbox.min);
+                // Only update if position/size changed
+                if bbox != self.last_info_rect {
+                    let mut builder = egui::ViewportBuilder::default()
+                        .with_title("Track Info")
+                        .with_transparent(true)
+                        .with_decorations(false)
+                        .with_always_on_top()
+                        .with_active(false)
+                        .with_inner_size(bbox.size())
+                        .with_position(bbox.min);
 
-                if self.settings_icon.width > 0 {
-                    builder = builder.with_icon(self.settings_icon.clone());
+                    if self.settings_icon.width > 0 {
+                        builder = builder.with_icon(self.settings_icon.clone());
+                    }
+
+                    ctx.show_viewport_immediate(info_id, builder, |ctx, _class| {
+                        if ctx.input(|i| i.viewport().close_requested()) {
+                            return;
+                        }
+                        ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
+                        
+                        let local_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, bbox.size());
+                        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("track_info_overlay")));
+
+                        // Force transparent background to prevent black box
+                        painter.rect_filled(local_rect, 0.0, egui::Color32::TRANSPARENT);
+
+                        if self.config.bg_opacity > 0 {
+                            let c = self.config.bg_color;
+                            let bg_color = egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], self.config.bg_opacity);
+                            painter.rect_filled(local_rect, 0.0, bg_color);
+                        }
+
+                        self.draw_track_info_internal(&painter, ctx, bbox.min, monitor);
+                    });
+                    self.last_info_rect = bbox;
                 }
-
-                ctx.show_viewport_immediate(info_id, builder, |ctx, _class| {
-                    if ctx.input(|i| i.viewport().close_requested()) {
-                        return;
-                    }
-                    ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
-                    
-                    let local_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, bbox.size());
-                    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("track_info_overlay")));
-
-                    if self.config.bg_opacity > 0 {
-                        let c = self.config.bg_color;
-                        let bg_color = egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], self.config.bg_opacity);
-                        painter.rect_filled(local_rect, 0.0, bg_color);
-                    }
-
-                    self.draw_track_info_internal(&painter, ctx, bbox.min, monitor);
-                });
             }
         } else {
             ctx.send_viewport_cmd_to(info_id, egui::ViewportCommand::Close);
+            self.last_info_rect = egui::Rect::NOTHING;
         }
 
         // ── 3. Settings viewport ───────────────────────────────
