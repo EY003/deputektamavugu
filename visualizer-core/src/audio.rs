@@ -643,7 +643,13 @@ impl AudioProcessor {
             }
         }
 
-        self.update_ballistics(&self.smoothed_buf[..num_bars], s, dt);
+                // Take the buffer out of `self` so we can hold an immutable slice of it
+        // while calling the `&mut self` method. Restored right after, so the
+        // allocation/capacity survives between frames.
+        let smoothed_buf = std::mem::take(&mut self.smoothed_buf);
+        self.update_ballistics(&smoothed_buf[..num_bars], s, dt);
+        self.smoothed_buf = smoothed_buf;
+
         let (beat, phase) = self.detect_rhythm(s, dt);
 
         Some(BarFrame {
