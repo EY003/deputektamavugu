@@ -621,42 +621,45 @@ impl AudioProcessor {
         }
 
         // ── time-domain smoothing using a flat ring buffer ───────
-        let avg = s.average_size.max(1);
-        let needed = avg * num_bars;
-        if self.frame_ring.len() != needed {
-            self.frame_ring.resize(needed, 0.0);
-            self.frame_ring_pos = 0;
-            self.frame_ring_count = 0;
-        }
-        let ring_len = self.frame_ring.len();
-        if self.frame_ring_count < avg {
-            self.frame_ring_count += 1;
-        }
-        let base = self.frame_ring_pos * num_bars;
-        self.frame_ring[base..base + num_bars].copy_from_slice(&self.mapped);
-        self.frame_ring_pos = (self.frame_ring_pos + 1) % avg;
+let avg = s.average_size.max(1);
+let needed = avg * num_bars;
+if self.frame_ring.len() != needed {
+    self.frame_ring.resize(needed, 0.0);
+    self.frame_ring_pos = 0;
+    self.frame_ring_count = 0;
+}
+if self.frame_ring_count < avg {
+    self.frame_ring_count += 1;
+}
+let base = self.frame_ring_pos * num_bars;
+self.frame_ring[base..base + num_bars].copy_from_slice(&self.mapped);
+self.frame_ring_pos = (self.frame_ring_pos + 1) % avg;
 
-        // Sum all frames in the ring (reuse `smoothed` as accumulator).
-        self.smoothed.fill(0.0);
-        for f in 0..self.frame_ring_count {
-            let offset = f * num_bars;
-            for i in 0..num_bars {
-                self.smoothed[i] += self.frame_ring[offset + i];
-            }
-        }
-        let inv = 1.0 / self.frame_ring_count as f32;
-        for v in self.smoothed.iter_mut() { *v *= inv; }
+// Sum all frames in the ring (reuse `smoothed` as accumulator).
+self.smoothed.fill(0.0);
+for f in 0..self.frame_ring_count {
+    let offset = f * num_bars;
+    for i in 0..num_bars {
+        self.smoothed[i] += self.frame_ring[offset + i];
+    }
+}
+let inv = 1.0 / self.frame_ring_count as f32;
+for v in self.smoothed.iter_mut() { *v *= inv; }
 
-        // ── per-frame peak normalization ──────────────────────────
-        if s.per_frame_normalization {
-            let peak = self.smoothed.iter().cloned().fold(0.0f32, f32::max);
-            if peak > 0.001 {
-                for v in self.smoothed.iter_mut() { *v /= peak; }
-            }
-        }
+// ── per-frame peak normalization ──────────────────────────
+if s.per_frame_normalization {
+    let peak = self.smoothed.iter().cloned().fold(0.0f32, f32::max);
+    if peak > 0.001 {
+        for v in self.smoothed.iter_mut() { *v /= peak; }
+    }
+}
 
-        self.update_ballistics(&self.smoothed, s, dt);
-        let (beat, phase) = self.detect_rhythm(s, dt);
+// ── FIXED: move `smoothed` out to avoid the double-borrow ─
+let smoothed = std::mem::take(&mut self.smoothed);
+self.update_ballistics(&smoothed, s, dt);
+self.smoothed = smoothed;
+
+let (beat, phase) = self.detect_rhythm(s, dt);
 
         Some(BarFrame {
             values: self.bar_values.clone(),
