@@ -700,94 +700,112 @@ impl VisualizerApp {
     }
 
     // ── Overlay geometry ─────────────────────────────────────
-
-    /// Compute the tight bounding rect of everything we draw, expressed in
-    /// monitor coordinates. This is what the overlay window is resized to.
     fn compute_overlay_rect(&self, monitor: egui::Rect) -> egui::Rect {
         let n_bars = self.visual_num_bars().max(1);
         let stride = self.config.bar_width + self.config.bar_gap;
         let bars_extent = (n_bars as f32 * stride - self.config.bar_gap).max(1.0);
 
-        let scale = if self.config.max_bar_height > 0.0 {
-            self.config.max_bar_height
-        } else {
-            monitor.height() * self.config.height_scale
+        let rect_len = match self.config.visualizer_direction {
+            VisualizerDirection::Up | VisualizerDirection::Down => {
+                monitor.height() * self.config.height_scale
+            }
+            VisualizerDirection::Left | VisualizerDirection::Right => {
+                monitor.width() * self.config.height_scale
+            }
         };
-        let scale = scale.max(1.0);
+        let max_bar_h = if self.config.max_bar_height > 0.0 {
+            self.config.max_bar_height.min(rect_len)
+        } else {
+            rect_len
+        };
 
         let cx = monitor.center().x + self.config.x_offset;
         let cy = monitor.center().y + self.config.y_offset;
 
         let bars_rect = match self.config.visualizer_direction {
             VisualizerDirection::Up => egui::Rect::from_min_max(
-                egui::pos2(cx - bars_extent / 2.0, monitor.bottom() + self.config.y_offset - scale),
+                egui::pos2(cx - bars_extent / 2.0, monitor.bottom() + self.config.y_offset - max_bar_h),
                 egui::pos2(cx + bars_extent / 2.0, monitor.bottom() + self.config.y_offset),
             ),
             VisualizerDirection::Down => egui::Rect::from_min_max(
                 egui::pos2(cx - bars_extent / 2.0, monitor.top() + self.config.y_offset),
-                egui::pos2(cx + bars_extent / 2.0, monitor.top() + self.config.y_offset + scale),
+                egui::pos2(cx + bars_extent / 2.0, monitor.top() + self.config.y_offset + max_bar_h),
             ),
             VisualizerDirection::Right => egui::Rect::from_min_max(
                 egui::pos2(monitor.left() + self.config.x_offset, cy - bars_extent / 2.0),
-                egui::pos2(monitor.left() + self.config.x_offset + scale, cy + bars_extent / 2.0),
+                egui::pos2(monitor.left() + self.config.x_offset + max_bar_h, cy + bars_extent / 2.0),
             ),
             VisualizerDirection::Left => egui::Rect::from_min_max(
-                egui::pos2(monitor.right() + self.config.x_offset - scale, cy - bars_extent / 2.0),
+                egui::pos2(monitor.right() + self.config.x_offset - max_bar_h, cy - bars_extent / 2.0),
                 egui::pos2(monitor.right() + self.config.x_offset, cy + bars_extent / 2.0),
             ),
         };
 
         let mut bbox = bars_rect;
 
-        // Track info bbox — same positioning math as drawing.
         let cfg = &self.config.track_info;
-        let info_present = (cfg.show_cover_art && self.cover_texture.is_some())
-            || cfg.show_title || cfg.show_artist;
-        if info_present {
-            let margin = 40.0;
-            let art_size = if cfg.show_cover_art { cfg.cover_size } else { 0.0 };
-            let est_text_h = cfg.title_font_size * cfg.line_height
-                + cfg.artist_font_size * cfg.line_height
-                + 8.0;
-            let est_text_w = 500.0_f32;
+        let show_art = cfg.show_cover_art && self.cover_texture.is_some();
+        let has_track = self.track_info.is_some();
+        let show_text = has_track && (cfg.show_title || cfg.show_artist);
 
+        if has_track && (show_art || show_text) {
+            let margin = 40.0;
+            let art_size = if show_art { cfg.cover_size } else { 0.0 };
             let art_x = monitor.right() - margin - art_size + cfg.cover_x_offset;
             let art_y = monitor.top() + margin + cfg.cover_y_offset;
 
-            let info_left = if art_size > 0.0 { art_x - est_text_w } else { art_x - est_text_w };
-            let info_right = (art_x + art_size).max(art_x + est_text_w.min(art_size));
-            let info_top = art_y;
-            let info_bottom = art_y + art_size + est_text_h;
+            if show_art {
+                let art_rect = egui::Rect::from_min_size(
+                    egui::pos2(art_x, art_y),
+                    egui::vec2(art_size, art_size),
+                );
+                bbox = bbox.union(art_rect);
+            }
 
-            let info_rect = egui::Rect::from_min_max(
-                egui::pos2(info_left, info_top),
-                egui::pos2(info_right, info_bottom),
-            );
-            bbox = bbox.union(info_rect);
+            if show_text {
+                let text_x = monitor.right() - margin + cfg.text_x_offset;
+                let mut text_y = monitor.top() + margin + cfg.text_y_offset;
+                if show_art {
+                    text_y += art_size + 14.0;
+                }
+                let est_h = (cfg.title_font_size + cfg.artist_font_size) * cfg.line_height.max(1.0)
+                    + 40.0;
+                let est_w = 600.0_f32;
+
+                let text_rect = match cfg.alignment {
+                    TrackTextAlign::Right => egui::Rect::from_min_max(
+                        egui::pos2(text_x - est_w, text_y),
+                        egui::pos2(text_x + 20.0, text_y + est_h),
+                    ),
+                    TrackTextAlign::Left => egui::Rect::from_min_max(
+                        egui::pos2(text_x - 20.0, text_y),
+                        egui::pos2(text_x + est_w, text_y + est_h),
+                    ),
+                    TrackTextAlign::Center => egui::Rect::from_min_max(
+                        egui::pos2(text_x - est_w / 2.0, text_y),
+                        egui::pos2(text_x + est_w / 2.0, text_y + est_h),
+                    ),
+                };
+                bbox = bbox.union(text_rect);
+            }
         }
 
-        // FPS badge
         if self.config.show_fps {
-            let fps_rect = egui::Rect::from_min_size(monitor.left_top() + egui::vec2(20.0, 20.0), egui::vec2(160.0, 30.0));
+            let fps_rect = egui::Rect::from_min_size(
+                monitor.left_top() + egui::vec2(20.0, 20.0),
+                egui::vec2(160.0, 30.0),
+            );
             bbox = bbox.union(fps_rect);
         }
 
-        // Pad for outlines / shadows / peak-hold markers / rounding.
         let pad = 32.0;
         let bbox = bbox.expand(pad);
 
-        // Ensure a minimum size so the window never collapses to nothing.
         let min = egui::vec2(80.0, 60.0);
         let size = bbox.size().max(min);
         let center = bbox.center();
-        let mut result = egui::Rect::from_center_size(center, size);
-
-        // Clamp to monitor
-        result = result.intersect(monitor);
-
-        result
+        egui::Rect::from_center_size(center, size).intersect(monitor)
     }
-
     // ── Palette updates ──────────────────────────────────────
 
     fn update_palettes(&mut self) {
@@ -1273,11 +1291,17 @@ impl VisualizerApp {
     /// and `Smooth` modes, all directions, all color modes and vertical
     /// segmentation are handled here so the whole bar region is one draw
     /// call instead of N or N*S.
-    fn draw_bars(&mut self, painter: &egui::Painter, ctx: &egui::Context,
-                 local_rect: egui::Rect, canvas_h: f32, canvas_w: f32)
-    {
+        fn draw_bars(
+        &mut self,
+        painter: &egui::Painter,
+        ctx: &egui::Context,
+        monitor: egui::Rect,
+        overlay_origin: egui::Pos2,
+    ) {
         let base_num_bars = self.current_bars.len();
-        if base_num_bars == 0 { return; }
+        if base_num_bars == 0 {
+            return;
+        }
         let time = ctx.input(|i| i.time) as f32;
         let visual_num_bars = self.visual_num_bars();
 
@@ -1290,101 +1314,151 @@ impl VisualizerApp {
         let freq_dir = self.config.frequency_direction;
         let dir = self.config.visualizer_direction;
         let is_smooth = self.config.bar_interpolation == BarInterpolation::Smooth;
-        let outline_on = self.config.visualizer_outline_enabled && self.config.visualizer_outline_thickness > 0.0;
+        let outline_on =
+            self.config.visualizer_outline_enabled && self.config.visualizer_outline_thickness > 0.0;
 
-        // Choose the coordinate scale: bars extend along the axis dictated
-        // by direction. We use monitor size as the canvas so the total
-        // extent is stable regardless of the (tiny) window we draw into.
-        let (rect_len, start_pos, anchor) = match dir {
+        let (rect_len, start_pos_m, anchor_m) = match dir {
             VisualizerDirection::Up => (
-                canvas_h * self.config.height_scale,
-                local_rect.center().x - total_size / 2.0,
-                local_rect.bottom(),
+                monitor.height() * self.config.height_scale,
+                monitor.center().x - total_size / 2.0 + self.config.x_offset,
+                monitor.bottom() + self.config.y_offset,
             ),
             VisualizerDirection::Down => (
-                canvas_h * self.config.height_scale,
-                local_rect.center().x - total_size / 2.0,
-                local_rect.top(),
+                monitor.height() * self.config.height_scale,
+                monitor.center().x - total_size / 2.0 + self.config.x_offset,
+                monitor.top() + self.config.y_offset,
             ),
             VisualizerDirection::Right => (
-                canvas_w * self.config.height_scale,
-                local_rect.center().y - total_size / 2.0,
-                local_rect.left(),
+                monitor.width() * self.config.height_scale,
+                monitor.center().y - total_size / 2.0 + self.config.y_offset,
+                monitor.left() + self.config.x_offset,
             ),
             VisualizerDirection::Left => (
-                canvas_w * self.config.height_scale,
-                local_rect.center().y - total_size / 2.0,
-                local_rect.right(),
+                monitor.width() * self.config.height_scale,
+                monitor.center().y - total_size / 2.0 + self.config.y_offset,
+                monitor.right() + self.config.x_offset,
             ),
         };
 
-        // Whether bars use per-vertical-segment coloring (the vertical
-        // color modes and vertical motion shapes).
+        let ov = overlay_origin.to_vec2();
+        let start_pos = start_pos_m
+            - (match dir {
+                VisualizerDirection::Up | VisualizerDirection::Down => ov.x,
+                VisualizerDirection::Left | VisualizerDirection::Right => ov.y,
+            });
+        let anchor = anchor_m
+            - (match dir {
+                VisualizerDirection::Up | VisualizerDirection::Down => ov.y,
+                VisualizerDirection::Left | VisualizerDirection::Right => ov.x,
+            });
+
+        let mut max_val = 0.0f32;
+        for i in 0..base_num_bars {
+            max_val = max_val.max(self.current_bars[i]);
+        }
+        let max_h_drawn = (max_val * rect_len)
+            .min(if max_h > 0.0 { max_h } else { rect_len })
+            .max(1.0);
+
+        let gradient_rect_m = match dir {
+            VisualizerDirection::Up => egui::Rect::from_min_max(
+                egui::pos2(
+                    monitor.center().x - total_size / 2.0 + self.config.x_offset,
+                    monitor.bottom() + self.config.y_offset - max_h_drawn,
+                ),
+                egui::pos2(
+                    monitor.center().x + total_size / 2.0 + self.config.x_offset,
+                    monitor.bottom() + self.config.y_offset,
+                ),
+            ),
+            VisualizerDirection::Down => egui::Rect::from_min_max(
+                egui::pos2(
+                    monitor.center().x - total_size / 2.0 + self.config.x_offset,
+                    monitor.top() + self.config.y_offset,
+                ),
+                egui::pos2(
+                    monitor.center().x + total_size / 2.0 + self.config.x_offset,
+                    monitor.top() + self.config.y_offset + max_h_drawn,
+                ),
+            ),
+            VisualizerDirection::Right => egui::Rect::from_min_max(
+                egui::pos2(
+                    monitor.left() + self.config.x_offset,
+                    monitor.center().y - total_size / 2.0 + self.config.y_offset,
+                ),
+                egui::pos2(
+                    monitor.left() + self.config.x_offset + max_h_drawn,
+                    monitor.center().y + total_size / 2.0 + self.config.y_offset,
+                ),
+            ),
+            VisualizerDirection::Left => egui::Rect::from_min_max(
+                egui::pos2(
+                    monitor.right() + self.config.x_offset - max_h_drawn,
+                    monitor.center().y - total_size / 2.0 + self.config.y_offset,
+                ),
+                egui::pos2(
+                    monitor.right() + self.config.x_offset,
+                    monitor.center().y + total_size / 2.0 + self.config.y_offset,
+                ),
+            ),
+        };
+        let gradient_rect = gradient_rect_m.translate(-ov);
+
         let is_static_multi_vertical = self.config.color_mode == ColorMode::StaticMultiple
             && self.config.static_mode == StaticDistributionMode::Vertical;
         let is_animated_vertical = self.config.color_mode == ColorMode::Animated
             && self.config.color_change_motion.shape.uses_vertical_axis();
         let is_vertical = is_static_multi_vertical || is_animated_vertical;
-        let n_segments = if is_vertical {
-            if is_static_multi_vertical {
-                self.active_palettes.static_multi_colors.len().clamp(1, 32)
-            } else {
-                self.active_palettes.animated_colors.len().max(1).clamp(6, 16)
-            }
-        } else { 1 };
+        let is_blocks = self.config.vertical_color_style == VerticalColorStyle::Blocks;
 
-        // Bounding rect used for gradient projection (matches original).
-        let gradient_rect = match dir {
-            VisualizerDirection::Up => egui::Rect::from_min_max(
-                egui::pos2(local_rect.center().x - total_size / 2.0, local_rect.bottom() - rect_len.max(1.0)),
-                egui::pos2(local_rect.center().x + total_size / 2.0, local_rect.bottom()),
-            ),
-            VisualizerDirection::Down => egui::Rect::from_min_max(
-                egui::pos2(local_rect.center().x - total_size / 2.0, local_rect.top()),
-                egui::pos2(local_rect.center().x + total_size / 2.0, local_rect.top() + rect_len.max(1.0)),
-            ),
-            VisualizerDirection::Right => egui::Rect::from_min_max(
-                egui::pos2(local_rect.left(), local_rect.center().y - total_size / 2.0),
-                egui::pos2(local_rect.left() + rect_len.max(1.0), local_rect.center().y + total_size / 2.0),
-            ),
-            VisualizerDirection::Left => egui::Rect::from_min_max(
-                egui::pos2(local_rect.right() - rect_len.max(1.0), local_rect.center().y - total_size / 2.0),
-                egui::pos2(local_rect.right(), local_rect.center().y + total_size / 2.0),
-            ),
+        let n_segments = if is_static_multi_vertical {
+            if is_blocks {
+                self.active_palettes.static_multi_colors.len().max(1)
+            } else {
+                32
+            }
+        } else if is_animated_vertical {
+            if is_blocks {
+                self.active_palettes.animated_colors.len().max(1).clamp(6, 16)
+            } else {
+                24
+            }
+        } else {
+            1
         };
 
         self.mesh.reset();
 
         if is_smooth {
             self.build_smooth_mesh(
-                painter, &gradient_rect, dir, start_pos, anchor, rect_len,
-                total_size, bar_width, stride, visual_num_bars, base_num_bars,
-                freq_dir, max_h, n_segments, is_vertical, time,
+                &gradient_rect, dir, start_pos, anchor, rect_len, bar_width, stride,
+                visual_num_bars, base_num_bars, freq_dir, max_h, n_segments, is_vertical, time,
             );
         } else {
             self.build_step_mesh(
-                painter, &gradient_rect, dir, start_pos, anchor, rect_len,
-                bar_width, stride, visual_num_bars, base_num_bars,
-                freq_dir, max_h, radius, n_segments, is_vertical, time,
+                &gradient_rect, dir, start_pos, anchor, rect_len, bar_width, stride,
+                visual_num_bars, base_num_bars, freq_dir, max_h, n_segments, is_vertical, time,
             );
         }
 
-        // One draw call for all bars.
         if !self.mesh.indices.is_empty() {
             painter.add(egui::Shape::mesh(self.mesh.take_mesh()));
         }
 
-        // Outlines (only when enabled) and peak-hold markers stay as
-        // individual small painter calls — they're cheap.
         if outline_on {
             let oc = self.config.visualizer_outline_color;
             let stroke_color = self.apply_vis(egui::Color32::from_rgb(oc[0], oc[1], oc[2]));
-            let stroke = egui::Stroke::new(self.config.visualizer_outline_thickness, stroke_color);
+            let stroke =
+                egui::Stroke::new(self.config.visualizer_outline_thickness, stroke_color);
             for i in 0..visual_num_bars {
                 let idx = frequency_index(i, base_num_bars, freq_dir);
-                let len = (self.current_bars[idx] * rect_len).min(if max_h > 0.0 { max_h } else { rect_len });
-                if len <= 0.5 { continue; }
-                let rect = self.bar_rect(dir, start_pos + i as f32 * stride, bar_width, anchor, len);
+                let len = (self.current_bars[idx] * rect_len)
+                    .min(if max_h > 0.0 { max_h } else { rect_len });
+                if len <= 0.5 {
+                    continue;
+                }
+                let perp = start_pos + i as f32 * stride;
+                let rect = self.bar_rect(dir, perp, bar_width, anchor, len);
                 painter.rect_stroke(rect, radius, stroke);
             }
         }
@@ -1393,17 +1467,29 @@ impl VisualizerApp {
             for i in 0..visual_num_bars {
                 let idx = frequency_index(i, base_num_bars, freq_dir);
                 let mut peak_len = self.current_peaks[idx] * rect_len;
-                if max_h > 0.0 { peak_len = peak_len.min(max_h); }
-                if peak_len <= 0.001 { continue; }
-                let perp = match dir {
-                    VisualizerDirection::Up | VisualizerDirection::Down => start_pos + i as f32 * stride + bar_width / 2.0,
-                    VisualizerDirection::Left | VisualizerDirection::Right => start_pos + i as f32 * stride + bar_width / 2.0,
-                };
-                let t = (peak_len / rect_len).clamp(0.0, 1.0);
-                let color = if is_vertical {
-                    self.vertical_color(dir, perp, anchor, peak_len, t, &gradient_rect, time)
+                if max_h > 0.0 {
+                    peak_len = peak_len.min(max_h);
+                }
+                if peak_len <= 0.001 {
+                    continue;
+                }
+                let perp = start_pos + i as f32 * stride + bar_width / 2.0;
+                let color = if is_static_multi_vertical {
+                    let t = (peak_len / rect_len).clamp(0.0, 1.0);
+                    self.apply_vis(static_multi_vertical_color(
+                        &self.active_palettes.static_multi_colors, t, is_blocks,
+                    ))
+                } else if is_animated_vertical {
+                    let peak_pos = bar_vertex(dir, perp, anchor, peak_len, 1.0);
+                    let x_norm = ((peak_pos.x - gradient_rect.left())
+                        / gradient_rect.width().max(1.0))
+                    .clamp(0.0, 1.0);
+                    self.apply_vis(self.sample_color_changing(x_norm, 1.0, time))
                 } else {
-                    self.get_color_at(i, visual_num_bars, perp, anchor, t, gradient_rect, time)
+                    let peak_pos = bar_vertex(dir, perp, anchor, peak_len, 1.0);
+                    self.get_color_at(
+                        i, visual_num_bars, peak_pos.x, peak_pos.y, 1.0, gradient_rect, time,
+                    )
                 };
                 draw_peak_hold(painter, dir, anchor, perp, peak_len, bar_width, color, is_smooth);
             }
@@ -1411,186 +1497,275 @@ impl VisualizerApp {
     }
 
     #[inline]
-    fn bar_rect(&self, dir: VisualizerDirection, perp_start: f32, bar_width: f32, anchor: f32, len: f32) -> egui::Rect {
+    fn bar_rect(
+        &self,
+        dir: VisualizerDirection,
+        perp_start: f32,
+        bar_width: f32,
+        anchor: f32,
+        len: f32,
+    ) -> egui::Rect {
         match dir {
             VisualizerDirection::Up => egui::Rect::from_min_max(
-                egui::pos2(perp_start, anchor - len), egui::pos2(perp_start + bar_width, anchor)),
+                egui::pos2(perp_start, anchor - len),
+                egui::pos2(perp_start + bar_width, anchor),
+            ),
             VisualizerDirection::Down => egui::Rect::from_min_max(
-                egui::pos2(perp_start, anchor), egui::pos2(perp_start + bar_width, anchor + len)),
+                egui::pos2(perp_start, anchor),
+                egui::pos2(perp_start + bar_width, anchor + len),
+            ),
             VisualizerDirection::Right => egui::Rect::from_min_max(
-                egui::pos2(anchor, perp_start), egui::pos2(anchor + len, perp_start + bar_width)),
+                egui::pos2(anchor, perp_start),
+                egui::pos2(anchor + len, perp_start + bar_width),
+            ),
             VisualizerDirection::Left => egui::Rect::from_min_max(
-                egui::pos2(anchor - len, perp_start), egui::pos2(anchor, perp_start + bar_width)),
+                egui::pos2(anchor - len, perp_start),
+                egui::pos2(anchor, perp_start + bar_width),
+            ),
         }
     }
 
-    fn vertical_color(&self, dir: VisualizerDirection, _perp: f32, _anchor: f32, _len: f32, t: f32, gradient_rect: &egui::Rect, time: f32) -> egui::Color32 {
-        match self.config.color_mode {
-            ColorMode::StaticMultiple => {
-                let blocks = self.config.vertical_color_style == VerticalColorStyle::Blocks;
-                self.apply_vis(static_multi_vertical_color(&self.active_palettes.static_multi_colors, t, blocks))
-            }
-            ColorMode::Animated => self.apply_vis(self.sample_color_changing(0.5, t, time)),
-            _ => {
-                // Fallback: sample via get_color_at
-                let _ = (dir, gradient_rect);
-                self.apply_vis(egui::Color32::WHITE)
-            }
-        }
-    }
-
-    /// Build the step-mode mesh (rectangles) into `self.mesh`.
     #[allow(clippy::too_many_arguments)]
-    fn build_step_mesh(&mut self, painter: &egui::Painter, gradient_rect: &egui::Rect,
-        dir: VisualizerDirection, start_pos: f32, anchor: f32, rect_len: f32,
-        bar_width: f32, stride: f32, visual_num_bars: usize, base_num_bars: usize,
-        freq_dir: FrequencyDirection, max_h: f32, radius: f32, n_segments: usize,
-        is_vertical: bool, time: f32)
-    {
-        let _ = painter;
+    fn build_step_mesh(
+        &mut self,
+        gradient_rect: &egui::Rect,
+        dir: VisualizerDirection,
+        start_pos: f32,
+        anchor: f32,
+        rect_len: f32,
+        bar_width: f32,
+        stride: f32,
+        visual_num_bars: usize,
+        base_num_bars: usize,
+        freq_dir: FrequencyDirection,
+        max_h: f32,
+        n_segments: usize,
+        is_vertical: bool,
+        time: f32,
+    ) {
         for i in 0..visual_num_bars {
             let idx = frequency_index(i, base_num_bars, freq_dir);
-            let len = (self.current_bars[idx] * rect_len).min(if max_h > 0.0 { max_h } else { rect_len });
-            if len <= 0.5 { continue; }
+            let len = (self.current_bars[idx] * rect_len)
+                .min(if max_h > 0.0 { max_h } else { rect_len });
+            if len <= 0.5 {
+                continue;
+            }
             let perp_start = start_pos + i as f32 * stride;
             let bar_rect = self.bar_rect(dir, perp_start, bar_width, anchor, len);
+            let perp_center = perp_start + bar_width / 2.0;
 
-            if !is_vertical || n_segments <= 1 {
-                // Single quad per bar.
-                let color = self.get_color_at(i, visual_num_bars,
-                    bar_rect.center().x, bar_rect.center().y, 0.5, *gradient_rect, time);
-                // Manual quad to skip per-bar rect_filled.
-                let (p1, p2, p3, p4) = match dir {
-                    VisualizerDirection::Up | VisualizerDirection::Down => (
-                        bar_rect.left_top(), bar_rect.left_bottom(),
-                        bar_rect.right_bottom(), bar_rect.right_top()),
-                    VisualizerDirection::Left | VisualizerDirection::Right => (
-                        bar_rect.left_top(), bar_rect.right_top(),
-                        bar_rect.right_bottom(), bar_rect.left_bottom()),
-                };
-                let _ = radius; // rounding handled by painter.rect_filled normally; keeping simple quads here
-                self.mesh.push_quad(p1, p2, p3, p4, color);
-            } else {
-                // N vertical segments per bar.
+            if is_vertical {
                 for k in 0..n_segments {
                     let t0 = k as f32 / n_segments as f32;
                     let t1 = (k + 1) as f32 / n_segments as f32;
-                    let seg = segment_rect(bar_rect, dir, t0, t1);
                     let t_mid = (t0 + t1) * 0.5;
-                    let color = match self.config.color_mode {
-                        ColorMode::StaticMultiple => {
-                            let blocks = self.config.vertical_color_style == VerticalColorStyle::Blocks;
-                            self.apply_vis(static_multi_vertical_color(&self.active_palettes.static_multi_colors, t_mid, blocks))
-                        }
-                        ColorMode::Animated => {
-                            let mid = seg.center();
-                            let x_norm = ((mid.x - gradient_rect.left()) / gradient_rect.width().max(1.0)).clamp(0.0, 1.0);
-                            self.apply_vis(self.sample_color_changing(x_norm, t_mid, time))
-                        }
-                        _ => self.get_color_at(i, visual_num_bars, seg.center().x, seg.center().y, t_mid, *gradient_rect, time),
+                    let seg_rect = segment_rect(bar_rect, dir, t0, t1);
+
+                    let color = if self.config.color_mode == ColorMode::StaticMultiple {
+                        let blocks =
+                            self.config.vertical_color_style == VerticalColorStyle::Blocks;
+                        self.apply_vis(static_multi_vertical_color(
+                            &self.active_palettes.static_multi_colors,
+                            t_mid,
+                            blocks,
+                        ))
+                    } else {
+                        let mid = seg_rect.center();
+                        let x_norm = ((mid.x - gradient_rect.left())
+                            / gradient_rect.width().max(1.0))
+                        .clamp(0.0, 1.0);
+                        self.apply_vis(self.sample_color_changing(x_norm, t_mid, time))
                     };
-                    let (p1, p2, p3, p4) = (seg.left_top(), seg.left_bottom(), seg.right_bottom(), seg.right_top());
+
+                    let (p1, p2, p3, p4) = (
+                        seg_rect.left_top(),
+                        seg_rect.left_bottom(),
+                        seg_rect.right_bottom(),
+                        seg_rect.right_top(),
+                    );
                     self.mesh.push_quad(p1, p2, p3, p4, color);
                 }
+            } else {
+                let tip_pos = bar_vertex(dir, perp_center, anchor, len, 1.0);
+                let base_pos = bar_vertex(dir, perp_center, anchor, len, 0.0);
+                let c_tip = self.get_color_at(
+                    i, visual_num_bars, tip_pos.x, tip_pos.y, 1.0, *gradient_rect, time,
+                );
+                let c_base = self.get_color_at(
+                    i, visual_num_bars, base_pos.x, base_pos.y, 0.0, *gradient_rect, time,
+                );
+
+                let (c_tl, c_bl, c_br, c_tr) = match dir {
+                    VisualizerDirection::Up => (c_tip, c_base, c_base, c_tip),
+                    VisualizerDirection::Down => (c_base, c_tip, c_tip, c_base),
+                    VisualizerDirection::Right => (c_base, c_base, c_tip, c_tip),
+                    VisualizerDirection::Left => (c_tip, c_tip, c_base, c_base),
+                };
+
+                self.mesh.push_quad_colored(
+                    bar_rect.left_top(),
+                    c_tl,
+                    bar_rect.left_bottom(),
+                    c_bl,
+                    bar_rect.right_bottom(),
+                    c_br,
+                    bar_rect.right_top(),
+                    c_tr,
+                );
             }
         }
     }
 
-    /// Build the smooth-mode mesh (interpolated curve) into `self.mesh`.
     #[allow(clippy::too_many_arguments)]
-    fn build_smooth_mesh(&mut self, painter: &egui::Painter, gradient_rect: &egui::Rect,
-        dir: VisualizerDirection, start_pos: f32, anchor: f32, rect_len: f32,
-        total_size: f32, bar_width: f32, stride: f32, visual_num_bars: usize,
-        base_num_bars: usize, freq_dir: FrequencyDirection, max_h: f32,
-        n_segments: usize, is_vertical: bool, time: f32)
-    {
-        let _ = painter;
-        // Precompute (perp, len, color_bot, color_top) per bar.
-        struct BarSample { perp: f32, len: f32 }
-        let mut bars: Vec<BarSample> = Vec::with_capacity(visual_num_bars);
+    fn build_smooth_mesh(
+        &mut self,
+        gradient_rect: &egui::Rect,
+        dir: VisualizerDirection,
+        start_pos: f32,
+        anchor: f32,
+        rect_len: f32,
+        bar_width: f32,
+        stride: f32,
+        visual_num_bars: usize,
+        base_num_bars: usize,
+        freq_dir: FrequencyDirection,
+        max_h: f32,
+        n_segments: usize,
+        is_vertical: bool,
+        time: f32,
+    ) {
+        struct Sample {
+            perp: f32,
+            len: f32,
+            c_tip: egui::Color32,
+            c_base: egui::Color32,
+        }
+        let mut bars: Vec<Sample> = Vec::with_capacity(visual_num_bars);
         for i in 0..visual_num_bars {
             let idx = frequency_index(i, base_num_bars, freq_dir);
-            let len = (self.current_bars[idx] * rect_len).min(if max_h > 0.0 { max_h } else { rect_len });
+            let len = (self.current_bars[idx] * rect_len)
+                .min(if max_h > 0.0 { max_h } else { rect_len });
             let perp = start_pos + i as f32 * stride + bar_width / 2.0;
-            bars.push(BarSample { perp, len });
+            let (c_tip, c_base) = if is_vertical {
+                (egui::Color32::TRANSPARENT, egui::Color32::TRANSPARENT)
+            } else {
+                let tip_pos = bar_vertex(dir, perp, anchor, len, 1.0);
+                let base_pos = bar_vertex(dir, perp, anchor, len, 0.0);
+                (
+                    self.get_color_at(
+                        i, visual_num_bars, tip_pos.x, tip_pos.y, 1.0, *gradient_rect, time,
+                    ),
+                    self.get_color_at(
+                        i, visual_num_bars, base_pos.x, base_pos.y, 0.0, *gradient_rect, time,
+                    ),
+                )
+            };
+            bars.push(Sample {
+                perp,
+                len,
+                c_tip,
+                c_base,
+            });
         }
-        if bars.is_empty() { return; }
-
-        // Extend so the curve reaches the window edges.
-        let first_perp = bars[0].perp - bar_width / 2.0;
-        let last_perp = bars[bars.len() - 1].perp + bar_width / 2.0;
+        if bars.is_empty() {
+            return;
+        }
 
         let steps = 6usize;
-        for i in 0..bars.len().saturating_sub(1) {
-            let a = &bars[i];
-            let b = &bars[i + 1];
-            // Colors at the two endpoints.
-            let ca_bot = self.color_for_perp_t(a.perp, anchor, 0.0, *gradient_rect, time, is_vertical, i, visual_num_bars, n_segments);
-            let ca_top = self.color_for_perp_t(a.perp, anchor, 1.0, *gradient_rect, time, is_vertical, i, visual_num_bars, n_segments);
-            let cb_bot = self.color_for_perp_t(b.perp, anchor, 0.0, *gradient_rect, time, is_vertical, i + 1, visual_num_bars, n_segments);
-            let cb_top = self.color_for_perp_t(b.perp, anchor, 1.0, *gradient_rect, time, is_vertical, i + 1, visual_num_bars, n_segments);
 
-            for s in 0..steps {
-                let t1 = s as f32 / steps as f32;
-                let t2 = (s + 1) as f32 / steps as f32;
-                let ts1 = smoothstep(0.0, 1.0, t1);
-                let ts2 = smoothstep(0.0, 1.0, t2);
-                let perp1 = a.perp + (b.perp - a.perp) * t1;
-                let perp2 = a.perp + (b.perp - a.perp) * t2;
-                let len1 = a.len + (b.len - a.len) * ts1;
-                let len2 = a.len + (b.len - a.len) * ts2;
-                let c1_top = lerp_color(ca_top, cb_top, t1);
-                let c2_top = lerp_color(ca_top, cb_top, t2);
-                let c1_bot = lerp_color(ca_bot, cb_bot, t1);
-                let c2_bot = lerp_color(ca_bot, cb_bot, t2);
-
-                let p_top1 = bar_vertex(dir, perp1, anchor, len1, 1.0);
-                let p_top2 = bar_vertex(dir, perp2, anchor, len2, 1.0);
-                let p_bot1 = bar_vertex(dir, perp1, anchor, 0.0, 0.0);
-                let p_bot2 = bar_vertex(dir, perp2, anchor, 0.0, 0.0);
-
-                self.mesh.push_quad_colored(p_top1, c1_top, p_bot1, c1_bot, p_bot2, c2_bot, p_top2, c2_top);
-            }
-        }
-        // End caps.
-        {
-            let a = &bars[0];
-            let ca_bot = self.color_for_perp_t(a.perp, anchor, 0.0, *gradient_rect, time, is_vertical, 0, visual_num_bars, n_segments);
-            let ca_top = self.color_for_perp_t(a.perp, anchor, 1.0, *gradient_rect, time, is_vertical, 0, visual_num_bars, n_segments);
-            let p_top = bar_vertex(dir, a.perp, anchor, a.len, 1.0);
-            let p_bot = bar_vertex(dir, a.perp, anchor, 0.0, 0.0);
-            let p_edge_top = bar_vertex(dir, first_perp, anchor, a.len, 1.0);
-            let p_edge_bot = bar_vertex(dir, first_perp, anchor, 0.0, 0.0);
-            self.mesh.push_quad_colored(p_top, ca_top, p_bot, ca_bot, p_edge_bot, ca_bot, p_edge_top, ca_top);
-        }
-        {
-            let a = &bars[bars.len() - 1];
-            let idx = bars.len() - 1;
-            let ca_bot = self.color_for_perp_t(a.perp, anchor, 0.0, *gradient_rect, time, is_vertical, idx, visual_num_bars, n_segments);
-            let ca_top = self.color_for_perp_t(a.perp, anchor, 1.0, *gradient_rect, time, is_vertical, idx, visual_num_bars, n_segments);
-            let p_top = bar_vertex(dir, a.perp, anchor, a.len, 1.0);
-            let p_bot = bar_vertex(dir, a.perp, anchor, 0.0, 0.0);
-            let p_edge_top = bar_vertex(dir, last_perp, anchor, a.len, 1.0);
-            let p_edge_bot = bar_vertex(dir, last_perp, anchor, 0.0, 0.0);
-            self.mesh.push_quad_colored(p_edge_top, ca_top, p_edge_bot, ca_bot, p_bot, ca_bot, p_top, ca_top);
-        }
-        let _ = total_size;
-    }
-
-    #[inline]
-    fn color_for_perp_t(&self, perp: f32, anchor: f32, t: f32, gradient_rect: egui::Rect,
-                        time: f32, is_vertical: bool, i: usize, visual_num_bars: usize,
-                        _n_segments: usize) -> egui::Color32
-    {
         if is_vertical {
-            self.vertical_color(VisualizerDirection::Up, perp, anchor, 0.0, t, &gradient_rect, time)
+            for i in 0..bars.len().saturating_sub(1) {
+                let a = &bars[i];
+                let b = &bars[i + 1];
+                for s in 0..steps {
+                    let t1 = s as f32 / steps as f32;
+                    let t2 = (s + 1) as f32 / steps as f32;
+                    let ts1 = smoothstep(0.0, 1.0, t1);
+                    let ts2 = smoothstep(0.0, 1.0, t2);
+                    let perp1 = a.perp + (b.perp - a.perp) * t1;
+                    let perp2 = a.perp + (b.perp - a.perp) * t2;
+                    let len1 = a.len + (b.len - a.len) * ts1;
+                    let len2 = a.len + (b.len - a.len) * ts2;
+
+                    for k in 0..n_segments {
+                        let t_bot = k as f32 / n_segments as f32;
+                        let t_top = (k + 1) as f32 / n_segments as f32;
+                        let t_mid = (t_bot + t_top) * 0.5;
+
+                        let color = if self.config.color_mode == ColorMode::StaticMultiple {
+                            let blocks =
+                                self.config.vertical_color_style == VerticalColorStyle::Blocks;
+                            self.apply_vis(static_multi_vertical_color(
+                                &self.active_palettes.static_multi_colors,
+                                t_mid,
+                                blocks,
+                            ))
+                        } else {
+                            let x_mid = (perp1 + perp2) * 0.5;
+                            let x_norm = ((x_mid - gradient_rect.left())
+                                / gradient_rect.width().max(1.0))
+                            .clamp(0.0, 1.0);
+                            self.apply_vis(self.sample_color_changing(x_norm, t_mid, time))
+                        };
+
+                        let p1 = bar_vertex(dir, perp1, anchor, len1, t_top);
+                        let p2 = bar_vertex(dir, perp2, anchor, len2, t_top);
+                        let p3 = bar_vertex(dir, perp2, anchor, len2, t_bot);
+                        let p4 = bar_vertex(dir, perp1, anchor, len1, t_bot);
+                        self.mesh.push_quad(p1, p4, p3, p2, color);
+                    }
+                }
+            }
         } else {
-            let pos = bar_vertex(VisualizerDirection::Up, perp, anchor, 0.0, 0.0);
-            self.get_color_at(i.min(visual_num_bars.saturating_sub(1)), visual_num_bars, pos.x, pos.y, t, gradient_rect, time)
+            for i in 0..bars.len().saturating_sub(1) {
+                let a = &bars[i];
+                let b = &bars[i + 1];
+                for s in 0..steps {
+                    let t1 = s as f32 / steps as f32;
+                    let t2 = (s + 1) as f32 / steps as f32;
+                    let ts1 = smoothstep(0.0, 1.0, t1);
+                    let ts2 = smoothstep(0.0, 1.0, t2);
+                    let perp1 = a.perp + (b.perp - a.perp) * t1;
+                    let perp2 = a.perp + (b.perp - a.perp) * t2;
+                    let len1 = a.len + (b.len - a.len) * ts1;
+                    let len2 = a.len + (b.len - a.len) * ts2;
+
+                    let c1_tip = lerp_color(a.c_tip, b.c_tip, t1);
+                    let c2_tip = lerp_color(a.c_tip, b.c_tip, t2);
+                    let c1_base = lerp_color(a.c_base, b.c_base, t1);
+                    let c2_base = lerp_color(a.c_base, b.c_base, t2);
+
+                    let pt1 = bar_vertex(dir, perp1, anchor, len1, 1.0);
+                    let pt2 = bar_vertex(dir, perp2, anchor, len2, 1.0);
+                    let pb1 = bar_vertex(dir, perp1, anchor, len1, 0.0);
+                    let pb2 = bar_vertex(dir, perp2, anchor, len2, 0.0);
+                    self.mesh.push_quad_colored(
+                        pt1, c1_tip, pb1, c1_base, pb2, c2_base, pt2, c2_tip,
+                    );
+                }
+            }
+
+            let first = &bars[0];
+            let edge_perp = first.perp - bar_width / 2.0;
+            let pt = bar_vertex(dir, first.perp, anchor, first.len, 1.0);
+            let pb = bar_vertex(dir, first.perp, anchor, first.len, 0.0);
+            let pet = bar_vertex(dir, edge_perp, anchor, first.len, 1.0);
+            let peb = bar_vertex(dir, edge_perp, anchor, first.len, 0.0);
+            self.mesh.push_quad_colored(
+                pt, first.c_tip, pb, first.c_base, peb, first.c_base, pet, first.c_tip,
+            );
+
+            let last = &bars[bars.len() - 1];
+            let edge_perp = last.perp + bar_width / 2.0;
+            let pt = bar_vertex(dir, last.perp, anchor, last.len, 1.0);
+            let pb = bar_vertex(dir, last.perp, anchor, last.len, 0.0);
+            let pet = bar_vertex(dir, edge_perp, anchor, last.len, 1.0);
+            let peb = bar_vertex(dir, edge_perp, anchor, last.len, 0.0);
+            self.mesh.push_quad_colored(
+                pet, last.c_tip, peb, last.c_base, pb, last.c_base, pt, last.c_tip,
+            );
         }
     }
-}
-
 // ═══════════════════════════════════════════════════════════════
 // draw_spaced helper
 // ═══════════════════════════════════════════════════════════════
@@ -2453,13 +2628,18 @@ impl eframe::App for VisualizerApp {
         }
 
         // ── Capture monitor rect once ────────────────────────
-        if self.monitor_rect.is_none() {
+                if self.monitor_rect.is_none() {
             let sr = ctx.screen_rect();
             if sr.width() > 100.0 && sr.height() > 100.0 {
                 self.monitor_rect = Some(sr);
             }
         }
-        let monitor = self.monitor_rect.unwrap_or_else(|| ctx.screen_rect());
+        // If we still don't know the monitor (very first frame), skip drawing
+        // and shrinking this frame so we don't misplace anything.
+        let Some(monitor) = self.monitor_rect else {
+            ctx.request_repaint();
+            return;
+        };
 
         // ── Compute content bbox & shrink window ─────────────
         let target = self.compute_overlay_rect(monitor);
@@ -2492,7 +2672,7 @@ impl eframe::App for VisualizerApp {
             painter.rect_filled(local_rect, 0.0, bg_color);
         }
 
-        self.draw_bars(&painter, ctx, local_rect, monitor.height(), monitor.width());
+        self.draw_bars(&painter, ctx, monitor, overlay_origin);
         self.draw_track_info(&painter, ctx, local_rect, overlay_origin, monitor);
 
         if self.config.show_fps {
