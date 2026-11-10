@@ -23,12 +23,8 @@ pub struct TrackInfo {
     pub cover_art: Option<Vec<u8>>,
 }
 
-pub fn log_smtc(_msg: &str) {
-    // Logging stub kept so call sites compile.
-}
+pub fn log_smtc(_msg: &str) {}
 
-/// Event-driven SMTC listener. No polling — we get callbacks when the
-/// current session changes, and when its media properties change.
 pub fn spawn_smtc_listener<F>(
     tx: Sender<TrackInfo>,
     should_quit: Arc<AtomicBool>,
@@ -58,11 +54,12 @@ pub fn spawn_smtc_listener<F>(
 
         let session_slot: Arc<Mutex<Option<GlobalSystemMediaTransportControlsSession>>> =
             Arc::new(Mutex::new(None));
+
         let tx = Arc::new(tx);
         let on_update = Arc::new(on_update);
         let should_quit = Arc::clone(&should_quit);
+        let session_count = Arc::clone(&session_count);
 
-                // ── CurrentSessionChanged handler ──────────────────────
         {
             let manager_for_handler = manager.clone();
             let session_slot = Arc::clone(&session_slot);
@@ -77,20 +74,23 @@ pub fn spawn_smtc_listener<F>(
                     if should_quit.load(Ordering::Relaxed) {
                         return Ok(());
                     }
+
                     if let Ok(session) = manager_for_handler.GetCurrentSession() {
                         if let Ok(mut slot) = session_slot.lock() {
                             *slot = Some(session.clone());
                         }
-                        let tx = Arc::clone(&tx);
-                        let on_update = Arc::clone(&on_update);
+
+                        let tx_cb = Arc::clone(&tx);
+                        let on_update_cb = Arc::clone(&on_update);
                         let session_for_handler = session.clone();
+
                         let _ = session.MediaPropertiesChanged(
                             &TypedEventHandler::new(
                                 move |_s: &Option<GlobalSystemMediaTransportControlsSession>,
                                       _e: &Option<windows::Media::Control::MediaPropertiesChangedEventArgs>| {
                                     let session = session_for_handler.clone();
-                                    let tx = Arc::clone(&tx);
-                                    let on_update = Arc::clone(&on_update);
+                                    let tx = Arc::clone(&tx_cb);
+                                    let on_update = Arc::clone(&on_update_cb);
                                     std::thread::spawn(move || {
                                         if let Ok(props) = session
                                             .TryGetMediaPropertiesAsync()
@@ -120,58 +120,14 @@ pub fn spawn_smtc_listener<F>(
                         });
                         on_update();
                     }
+
                     if let Ok(sessions) = manager_for_handler.GetSessions() {
-                        session_count.store(sessions.Size().unwrap_or(0) as usize, Ordering::Relaxed);
-                    }
-                    Ok(())
-                },
-            );
-
-            let _ = manager.CurrentSessionChanged(&handler);
-        }
-                        // Register MediaPropertiesChanged on the new session.
-                        let tx = Arc::clone(&tx);
-                        let on_update = Arc::clone(&on_update);
-                        let session_for_handler = session.clone();
-                        let _ = session.MediaPropertiesChanged(
-                            &TypedEventHandler::new(
-                                move |_s: &Option<GlobalSystemMediaTransportControlsSession>,
-                                      _e: &Option<windows::Media::Control::MediaPropertiesChangedEventArgs>| {
-                                    let session = session_for_handler.clone();
-                                    let tx = Arc::clone(&tx);
-                                    let on_update = Arc::clone(&on_update);
-                                    std::thread::spawn(move || {
-                                        if let Ok(props) = session
-                                            .TryGetMediaPropertiesAsync()
-                                            .and_then(|op| op.get())
-                                        {
-                                            let title = props.Title().map(|s| s.to_string()).unwrap_or_default();
-                                            let artist = props.Artist().map(|s| s.to_string()).unwrap_or_default();
-                                            let album = props.AlbumTitle().map(|s| s.to_string()).unwrap_or_default();
-                                            let cover_art = read_thumbnail(&props);
-                                            let _ = tx.send(TrackInfo { title, artist, album, cover_art });
-                                            on_update();
-                                        }
-                                    });
-                                    Ok(())
-                                },
-                            ),
+                        session_count.store(
+                            sessions.Size().unwrap_or(0) as usize,
+                            Ordering::Relaxed,
                         );
-                    } else {
-                        if let Ok(mut slot) = session_slot.lock() {
-                            *slot = None;
-                        }
-                        let _ = tx.send(TrackInfo {
-                            title: String::new(),
-                            artist: String::new(),
-                            album: String::new(),
-                            cover_art: None,
-                        });
-                        on_update();
                     }
-                    if let Ok(sessions) = manager.GetSessions() {
-                        session_count.store(sessions.Size().unwrap_or(0) as usize, Ordering::Relaxed);
-                    }
+
                     Ok(())
                 },
             );
@@ -179,7 +135,6 @@ pub fn spawn_smtc_listener<F>(
             let _ = manager.CurrentSessionChanged(&handler);
         }
 
-        // ── Message pump (required for COM callbacks to fire) ──
         let mut msg = MSG::default();
         loop {
             if should_quit.load(Ordering::Relaxed) {
