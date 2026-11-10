@@ -10,14 +10,14 @@ use arc_swap::ArcSwap;
 use visualizer_core::{
     audio::{AudioEngine, BarFrame},
     color,
-    config::{
+        config::{
         self as cfg,
-        AppConfig, AudioPreset, BarInterpolation, BeatFocusMode, BlendMode, ChannelMixMode,
+        AppConfig, AudioPreset, BarInterpolation, BlendMode,
         ColorChangePreset, ColorMode, ColorPreset, ColorSource, CustomAudioPreset, DecayMode,
-        FrequencyDirection, FrequencyScaling, GradientPreset, GradientSource, GradientStop,
+        FrequencyDirection, GradientPreset, GradientSource, GradientStop,
         MotionShape, PalettePriority, StaticDistributionMode, StaticMultiPreset,
         TrackInfoConfig, TrackTextAlign, TrackTextColorMode, VerticalColorStyle,
-        VisualizerDirection, WeightingCurve, WindowFunction,
+        VisualizerDirection,
     },
     musicbee::{self, TrackInfo},
 };
@@ -1859,7 +1859,7 @@ impl VisualizerApp {
                         mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, last.y), uv: egui::Pos2::ZERO, color: last_c_top });
                         mesh.indices.extend_from_slice(&[b_idx, b_idx+1, b_idx+2, b_idx, b_idx+2, b_idx+3]);
                     }
-                    painter.add(egui::Shape::mesh(mesh));
+                    painter.add(egui::Shape::mesh(std::mem::take(&mut mesh)));
                     if self.config.visualizer_outline_enabled && self.config.visualizer_outline_thickness > 0.0 {
                         buffers.pts.clear();
                         buffers.pts.extend_from_slice(&buffers.top_points);
@@ -1899,7 +1899,7 @@ impl VisualizerApp {
                         mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, y_top), uv: egui::Pos2::ZERO, color: c_top });
                         mesh.indices.extend_from_slice(&[base_idx, base_idx + 1, base_idx + 2, base_idx, base_idx + 2, base_idx + 3]);
                     }
-                    painter.add(egui::Shape::mesh(mesh));
+                    painter.add(egui::Shape::mesh(std::mem::take(&mut mesh)));
                     if self.config.visualizer_outline_enabled {
                         for i in 0..visual_num_bars {
                             let idx = frequency_index(i, base_num_bars, freq_dir);
@@ -1990,7 +1990,7 @@ impl VisualizerApp {
                         mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(last.x, last.y), uv: egui::Pos2::ZERO, color: last_c_bot });
                         mesh.indices.extend_from_slice(&[b_idx, b_idx+1, b_idx+2, b_idx, b_idx+2, b_idx+3]);
                     }
-                    painter.add(egui::Shape::mesh(mesh));
+                    painter.add(egui::Shape::mesh(std::mem::take(&mut mesh)));
                     if self.config.visualizer_outline_enabled && self.config.visualizer_outline_thickness > 0.0 {
                         buffers.pts.clear();
                         buffers.pts.extend_from_slice(&buffers.top_points);
@@ -2029,7 +2029,7 @@ impl VisualizerApp {
                         mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x1, top_y), uv: egui::Pos2::ZERO, color: c_top });
                         mesh.indices.extend_from_slice(&[base_idx, base_idx + 1, base_idx + 2, base_idx, base_idx + 2, base_idx + 3]);
                     }
-                    painter.add(egui::Shape::mesh(mesh));
+                    painter.add(egui::Shape::mesh(std::mem::take(&mut mesh)));
                     if self.config.visualizer_outline_enabled {
                         for i in 0..visual_num_bars {
                             let idx = frequency_index(i, base_num_bars, freq_dir);
@@ -2120,7 +2120,7 @@ impl VisualizerApp {
                         mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, bot_y_last), uv: egui::Pos2::ZERO, color: last_c_left });
                         mesh.indices.extend_from_slice(&[b_idx, b_idx+1, b_idx+2, b_idx, b_idx+2, b_idx+3]);
                     }
-                    painter.add(egui::Shape::mesh(mesh));
+                    painter.add(egui::Shape::mesh(std::mem::take(&mut mesh)));
                     if self.config.visualizer_outline_enabled && self.config.visualizer_outline_thickness > 0.0 {
                         buffers.pts.clear();
                         buffers.pts.extend_from_slice(&buffers.top_points);
@@ -2159,7 +2159,7 @@ impl VisualizerApp {
                         mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(left_x, y1), uv: egui::Pos2::ZERO, color: c_left });
                         mesh.indices.extend_from_slice(&[base_idx, base_idx + 1, base_idx + 2, base_idx, base_idx + 2, base_idx + 3]);
                     }
-                    painter.add(egui::Shape::mesh(mesh));
+                    painter.add(egui::Shape::mesh(std::mem::take(&mut mesh)));
                     if self.config.visualizer_outline_enabled {
                         for i in 0..visual_num_bars {
                             let idx = frequency_index(i, base_num_bars, freq_dir);
@@ -2250,7 +2250,7 @@ impl VisualizerApp {
                         mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(right_x, last.y), uv: egui::Pos2::ZERO, color: last_c_right });
                         mesh.indices.extend_from_slice(&[b_idx, b_idx+1, b_idx+2, b_idx, b_idx+2, b_idx+3]);
                     }
-                    painter.add(egui::Shape::mesh(mesh));
+                   painter.add(egui::Shape::mesh(std::mem::take(&mut mesh)));
                     if self.config.visualizer_outline_enabled && self.config.visualizer_outline_thickness > 0.0 {
                         buffers.pts.clear();
                         buffers.pts.extend_from_slice(&buffers.top_points);
@@ -2289,7 +2289,7 @@ impl VisualizerApp {
                         mesh.vertices.push(egui::epaint::Vertex { pos: egui::pos2(x0, y1), uv: egui::Pos2::ZERO, color: c_left });
                         mesh.indices.extend_from_slice(&[base_idx, base_idx + 1, base_idx + 2, base_idx, base_idx + 2, base_idx + 3]);
                     }
-                    painter.add(egui::Shape::mesh(mesh));
+                    painter.add(egui::Shape::mesh(std::mem::take(&mut mesh)));
                     if self.config.visualizer_outline_enabled {
                         for i in 0..visual_num_bars {
                             let idx = frequency_index(i, base_num_bars, freq_dir);
