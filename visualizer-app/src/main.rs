@@ -31,6 +31,9 @@ use tray_icon::{
     TrayIcon, TrayIconBuilder,
 };
 
+/// One frame at 60 Hz. Used to cap the main viewport's repaint rate.
+const TARGET_FRAME_TIME: Duration = Duration::from_millis(16);
+
 // ═══════════════════════════════════════════════════════════════
 // Icon loader
 // ═══════════════════════════════════════════════════════════════
@@ -577,9 +580,6 @@ struct SettingsState {
     last_bpm: f32,
     current_fps: f32,
     system_fonts: Vec<(String, String)>,
-    /// Wall-clock time of the last settings-viewport paint, used to throttle
-    /// pointer-move-only repaints. Drags/clicks/keys/wheel are never throttled.
-    last_paint_time: Option<Instant>,
 }
 
 fn lock_state(m: &Mutex<SettingsState>) -> std::sync::MutexGuard<'_, SettingsState> {
@@ -631,8 +631,6 @@ struct VisualizerApp {
     loaded_font_path: Option<String>,
     smtc_session_count: Arc<AtomicUsize>,
 
-    // Overlay rect cache — avoids recomputing `compute_overlay_rect` (which
-    // does costly text measurement) on every single main-viewport frame.
     overlay_cache_key: Option<u64>,
     overlay_cache_rect: egui::Rect,
 
@@ -744,7 +742,6 @@ impl VisualizerApp {
             last_bpm: 0.0,
             current_fps: 0.0,
             system_fonts: list_system_fonts(),
-            last_paint_time: None,
         }));
 
         Self {
@@ -798,20 +795,15 @@ impl VisualizerApp {
 
     // ── Overlay geometry ──────────────────────────────────────
 
-    /// Cheap key covering every input to `compute_overlay_rect`. If this
-    /// matches the previous frame, we reuse the cached rect and skip the
-    /// expensive `layout_no_wrap` text measurements entirely.
     fn overlay_key(&self, monitor: egui::Rect) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
 
-        // Monitor geometry
         monitor.min.x.to_bits().hash(&mut h);
         monitor.min.y.to_bits().hash(&mut h);
         monitor.max.x.to_bits().hash(&mut h);
         monitor.max.y.to_bits().hash(&mut h);
 
-        // Bar layout
         self.config.bar_width.to_bits().hash(&mut h);
         self.config.bar_gap.to_bits().hash(&mut h);
         self.config.height_scale.to_bits().hash(&mut h);
@@ -822,7 +814,6 @@ impl VisualizerApp {
         std::mem::discriminant(&self.config.visualizer_direction).hash(&mut h);
         std::mem::discriminant(&self.config.frequency_direction).hash(&mut h);
 
-        // Track info config
         let ti = &self.config.track_info;
         ti.show_cover_art.hash(&mut h);
         ti.cover_size.to_bits().hash(&mut h);
@@ -838,7 +829,6 @@ impl VisualizerApp {
         std::mem::discriminant(&ti.alignment).hash(&mut h);
         ti.font_path.hash(&mut h);
 
-        // Track text + cover presence
         self.track_id.hash(&mut h);
         self.cover_texture.is_some().hash(&mut h);
         if let Some(info) = &self.track_info {
@@ -4221,38 +4211,6 @@ fn run_settings_viewport(
         )));
     }
 
-    // ── Throttle hover-only repaints ─────────────────────────
-    //
-    // A focused settings window receives a WM_MOUSEMOVE for every pixel the
-    // cursor travels. For a 1 kHz gaming mouse that's ~1000 repaint requests
-    // per second from this viewport. Because both viewports share the
-    // eframe event-loop thread and the GPU context, each extra settings paint
-    // delays the *main* viewport's paint. The main viewport has a heavier
-    // paint (overlay rect, mesh, track text) so the visible effect is that
-    // the visualizer bars stutter while the (cheap) settings window stays
-    // smooth.
-    //
-    // Pure hover updates are cosmetic — the hover highlight lagging ≤ 33 ms
-    // behind the cursor is imperceptible. Drags, clicks, wheel, and key
-    // events are NEVER throttled, and drag deltas accumulate across frames
-    // in egui so sliders still track correctly.
-    let now = Instant::now();
-    let (has_moves, has_non_move) = ctx.input(|i| {
-        let has_moves = i.events.iter().any(|e| matches!(e, egui::Event::PointerMoved(_)));
-        let has_non_move = i.events.iter().any(|e| !matches!(e, egui::Event::PointerMoved(_)));
-        (has_moves, has_non_move)
-    });
-    if has_moves && !has_non_move {
-        if let Some(last) = st.last_paint_time {
-            let since = now.duration_since(last);
-            if since < Duration::from_millis(33) {
-                ctx.request_repaint_after(Duration::from_millis(33) - since);
-                return;
-            }
-        }
-    }
-    st.last_paint_time = Some(now);
-
     egui::CentralPanel::default()
         .frame(egui::Frame::none().fill(egui::Color32::BLACK))
         .show(ctx, |ui| {
@@ -4414,11 +4372,6 @@ impl eframe::App for VisualizerApp {
         let monitor_size = ctx.input(|i| i.viewport().monitor_size).unwrap_or(egui::vec2(1920.0, 1080.0));
         let monitor = egui::Rect::from_min_size(egui::Pos2::ZERO, monitor_size);
 
-        // Cached overlay rect: skips the expensive text-shaping work in
-        // `compute_overlay_rect` when nothing that affects it has changed.
-        // This is the single biggest cost saver for the main viewport's paint
-        // path and lets each main paint fit comfortably in the frame budget
-        // even while the settings viewport is also painting on input.
         let target = self.compute_overlay_rect_cached(ctx, monitor);
 
         let actual_pos = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min)).unwrap_or(egui::Pos2::ZERO);
@@ -4493,11 +4446,23 @@ impl eframe::App for VisualizerApp {
         }
         self.was_settings_open = open;
 
-        let moving = self.current_bars.iter().any(|&v| v > 0.0005)
-            || self.current_peaks.iter().any(|&v| v > 0.0005)
-            || self.config.color_mode == ColorMode::Animated;
-        if moving {
+        // Cap the main viewport at ~60 fps. Without this the loop spins as
+        // fast as the CPU can drive it (~150-250 fps on typical hardware),
+        // because `moving` is basically always true while audio is playing.
+        // That busy-loop starves the settings viewport whenever it needs a
+        // paint on the shared event-loop thread, so the visualizer bars
+        // visibly stutter while the settings window has focus and is
+        // receiving input. The audio engine already calls `request_repaint`
+        // on every new BarFrame (default 60 Hz), so we get smooth
+        // audio-driven updates either way; we just stop racing the frame
+        // clock. If the current frame took longer than 16 ms, we still ask
+        // for an immediate repaint so we recover gracefully.
+        let elapsed = self.last_frame_time.elapsed();
+        let remaining = TARGET_FRAME_TIME.saturating_sub(elapsed);
+        if remaining.is_zero() {
             ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(remaining);
         }
     }
 
