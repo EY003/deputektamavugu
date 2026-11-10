@@ -7,16 +7,21 @@ edition = "2021"
 visualizer-core = { path = "../visualizer-core" }
 eframe = "0.27"
 egui = "0.27"
-tokio = { version = "1", features = ["full"] }
 tray-icon = "0.11"
 global-hotkey = "0.4"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 image = "0.24"
-rfd = "0.14"
 crossbeam-channel = "0.5"
-glow = "0.13" # <--- Add this line to fix the `glow::Context` error later!
+glow = "0.13"
 arc-swap = "1.7"
 
 [build-dependencies]
 winres = "0.1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3
