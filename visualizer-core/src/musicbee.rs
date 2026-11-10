@@ -25,6 +25,8 @@ pub struct TrackInfo {
 
 pub fn log_smtc(_msg: &str) {}
 
+type UpdateFn = Arc<dyn Fn() + Send + Sync>;
+
 pub fn spawn_smtc_listener<F>(
     tx: Sender<TrackInfo>,
     should_quit: Arc<AtomicBool>,
@@ -46,27 +48,22 @@ pub fn spawn_smtc_listener<F>(
                 .and_then(|op| op.get())
             {
                 Ok(m) => break m,
-                Err(_) => {
-                    std::thread::sleep(std::time::Duration::from_millis(1000));
-                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(1000)),
             }
         };
 
-        let session_slot: Arc<Mutex<Option<GlobalSystemMediaTransportControlsSession>>> =
-            Arc::new(Mutex::new(None));
+        let tx: Arc<Sender<TrackInfo>> = Arc::new(tx);
+        let on_update: UpdateFn = Arc::new(on_update);
+        let should_quit_cb = Arc::clone(&should_quit);
+        let session_count_cb = Arc::clone(&session_count);
 
-        let tx = Arc::new(tx);
-        let on_update = Arc::new(on_update);
-        let should_quit = Arc::clone(&should_quit);
-        let session_count = Arc::clone(&session_count);
-
+        // ── Register CurrentSessionChanged ─────────────────────
         {
             let manager_for_handler = manager.clone();
-            let session_slot = Arc::clone(&session_slot);
-            let tx = Arc::clone(&tx);
-            let on_update = Arc::clone(&on_update);
-            let should_quit = Arc::clone(&should_quit);
-            let session_count = Arc::clone(&session_count);
+            let tx_cb = Arc::clone(&tx);
+            let on_update_cb = Arc::clone(&on_update);
+            let should_quit = Arc::clone(&should_quit_cb);
+            let session_count = Arc::clone(&session_count_cb);
 
             let handler = TypedEventHandler::new(
                 move |_sender: &Option<GlobalSystemMediaTransportControlsSessionManager>,
@@ -75,59 +72,25 @@ pub fn spawn_smtc_listener<F>(
                         return Ok(());
                     }
 
-                    if let Ok(session) = manager_for_handler.GetCurrentSession() {
-                        if let Ok(mut slot) = session_slot.lock() {
-                            *slot = Some(session.clone());
+                    match manager_for_handler.GetCurrentSession() {
+                        Ok(session) => {
+                            attach_session(&session, &tx_cb, &on_update_cb);
                         }
-
-                        let tx_cb = Arc::clone(&tx);
-                        let on_update_cb = Arc::clone(&on_update);
-                        let session_for_handler = session.clone();
-
-                        let _ = session.MediaPropertiesChanged(
-                            &TypedEventHandler::new(
-                                move |_s: &Option<GlobalSystemMediaTransportControlsSession>,
-                                      _e: &Option<windows::Media::Control::MediaPropertiesChangedEventArgs>| {
-                                    let session = session_for_handler.clone();
-                                    let tx = Arc::clone(&tx_cb);
-                                    let on_update = Arc::clone(&on_update_cb);
-                                    std::thread::spawn(move || {
-                                        if let Ok(props) = session
-                                            .TryGetMediaPropertiesAsync()
-                                            .and_then(|op| op.get())
-                                        {
-                                            let title = props.Title().map(|s| s.to_string()).unwrap_or_default();
-                                            let artist = props.Artist().map(|s| s.to_string()).unwrap_or_default();
-                                            let album = props.AlbumTitle().map(|s| s.to_string()).unwrap_or_default();
-                                            let cover_art = read_thumbnail(&props);
-                                            let _ = tx.send(TrackInfo { title, artist, album, cover_art });
-                                            on_update();
-                                        }
-                                    });
-                                    Ok(())
-                                },
-                            ),
-                        );
-                    } else {
-                        if let Ok(mut slot) = session_slot.lock() {
-                            *slot = None;
+                        Err(_) => {
+                            let _ = tx_cb.send(TrackInfo {
+                                title: String::new(),
+                                artist: String::new(),
+                                album: String::new(),
+                                cover_art: None,
+                            });
+                            on_update_cb();
                         }
-                        let _ = tx.send(TrackInfo {
-                            title: String::new(),
-                            artist: String::new(),
-                            album: String::new(),
-                            cover_art: None,
-                        });
-                        on_update();
                     }
 
                     if let Ok(sessions) = manager_for_handler.GetSessions() {
-                        session_count.store(
-                            sessions.Size().unwrap_or(0) as usize,
-                            Ordering::Relaxed,
-                        );
+                        session_count
+                            .store(sessions.Size().unwrap_or(0) as usize, Ordering::Relaxed);
                     }
-
                     Ok(())
                 },
             );
@@ -135,6 +98,15 @@ pub fn spawn_smtc_listener<F>(
             let _ = manager.CurrentSessionChanged(&handler);
         }
 
+        // ── Initial fetch (music may already be playing) ───────
+        if let Ok(session) = manager.GetCurrentSession() {
+            attach_session(&session, &tx, &on_update);
+        }
+        if let Ok(sessions) = manager.GetSessions() {
+            session_count.store(sessions.Size().unwrap_or(0) as usize, Ordering::Relaxed);
+        }
+
+        // ── Message pump ───────────────────────────────────────
         let mut msg = MSG::default();
         loop {
             if should_quit.load(Ordering::Relaxed) {
@@ -150,6 +122,49 @@ pub fn spawn_smtc_listener<F>(
             }
         }
     });
+}
+
+/// Fetch current properties, then register a `MediaPropertiesChanged` handler
+/// on the session so future changes are event-driven.
+fn attach_session(
+    session: &GlobalSystemMediaTransportControlsSession,
+    tx: &Arc<Sender<TrackInfo>>,
+    on_update: &UpdateFn,
+) {
+    // Fetch once immediately.
+    emit_props(session, tx, on_update);
+
+    // Then subscribe for future changes.
+    let tx_cb = Arc::clone(tx);
+    let on_update_cb = Arc::clone(on_update);
+    let session_cb = session.clone();
+    let _ = session.MediaPropertiesChanged(&TypedEventHandler::new(
+        move |_s: &Option<GlobalSystemMediaTransportControlsSession>,
+              _e: &Option<windows::Media::Control::MediaPropertiesChangedEventArgs>| {
+            let session = session_cb.clone();
+            let tx = Arc::clone(&tx_cb);
+            let on_update = Arc::clone(&on_update_cb);
+            std::thread::spawn(move || {
+                emit_props(&session, &tx, &on_update);
+            });
+            Ok(())
+        },
+    ));
+}
+
+fn emit_props(
+    session: &GlobalSystemMediaTransportControlsSession,
+    tx: &Arc<Sender<TrackInfo>>,
+    on_update: &UpdateFn,
+) {
+    if let Ok(props) = session.TryGetMediaPropertiesAsync().and_then(|op| op.get()) {
+        let title = props.Title().map(|s| s.to_string()).unwrap_or_default();
+        let artist = props.Artist().map(|s| s.to_string()).unwrap_or_default();
+        let album = props.AlbumTitle().map(|s| s.to_string()).unwrap_or_default();
+        let cover_art = read_thumbnail(&props);
+        let _ = tx.send(TrackInfo { title, artist, album, cover_art });
+        on_update();
+    }
 }
 
 fn read_thumbnail(
