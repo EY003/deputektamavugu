@@ -613,6 +613,7 @@ struct VisualizerApp {
     current_fps: f32,
     is_passthrough_set: bool,
     last_frame_time: Instant,
+    last_viewport_cmd_time: Instant,
     track_rx: crossbeam_channel::Receiver<TrackInfo>,
     track_info: Option<TrackInfo>,
     cover_texture: Option<egui::TextureHandle>,
@@ -748,6 +749,7 @@ impl VisualizerApp {
             current_fps: 0.0,
             is_passthrough_set: false,
             last_frame_time: Instant::now(),
+            last_viewport_cmd_time: Instant::now() - std::time::Duration::from_secs(1),
             track_rx,
             track_info: None,
             cover_texture: None,
@@ -4180,16 +4182,18 @@ fn run_settings_viewport(
             });
     }
 
-        // Config only ever changes in response to user input.
-    // Recomputing the (expensive) toml fingerprint on every PointerMoved
-    // event from this viewport starves the ROOT viewport's update loop and
-    // makes the visualizer bars stutter while the mouse is moving.
+    // Config only ever changes in response to real user input (clicks, drags,
+    // typing, wheel). Pure `PointerMoved` events cannot change config, and
+    // re-running the (expensive) `toml::to_string` fingerprint on every
+    // pointer-move frame keeps the shared event-loop thread busy, which in
+    // turn starves the ROOT viewport and makes the visualizer bars stutter
+    // while the mouse is moving over this window.
     let user_modified = ctx.input(|i| {
-        i.pointer.any_down()                               // slider drags, button held
-            || !i.keys_down.is_empty()                     // typing / holding a key
-            || i.events.iter().any(|e| {
-                !matches!(e, egui::Event::PointerMoved(_)) // clicks, wheel, text, etc.
-            })
+        i.pointer.any_down()
+            || !i.keys_down.is_empty()
+            || i.events
+                .iter()
+                .any(|e| !matches!(e, egui::Event::PointerMoved(_)))
     });
 
     let changed = if st.audio_dirty || user_modified {
@@ -4200,6 +4204,7 @@ fn run_settings_viewport(
     } else {
         false
     };
+
     let wants_close = st.close_requested;
     st.close_requested = false;
     drop(st);
@@ -4314,10 +4319,23 @@ impl eframe::App for VisualizerApp {
         let actual_pos = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min)).unwrap_or(egui::Pos2::ZERO);
         let actual_size = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size())).unwrap_or(egui::Vec2::ZERO);
 
-        // Send commands if the actual window differs from the target.
-        if (actual_size - target.size()).length() > 1.0 || (actual_pos - target.min).length() > 1.0 {
+        // Only re-issue the resize/position when the OS window is meaningfully
+        // off target AND we haven't already asked for a correction very recently.
+        //
+        // Without the cooldown, a non-focused or deferred state can cause the
+        // OS to refuse (or round) the requested rect, in which case
+        // `actual != target` forever. That produces a per-frame
+        // `InnerSize`/`OuterPosition` storm that starves the event-loop thread
+        // and freezes the visualizer while the settings window has focus.
+        let needs_correction = (actual_size - target.size()).length() > 2.0
+            || (actual_pos - target.min).length() > 2.0;
+        let cooldown_ok = now.duration_since(self.last_viewport_cmd_time)
+            > std::time::Duration::from_millis(100);
+
+        if needs_correction && cooldown_ok {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target.size()));
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target.min));
+            self.last_viewport_cmd_time = now;
         }
 
         let local_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, target.size());
