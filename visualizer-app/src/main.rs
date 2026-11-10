@@ -31,7 +31,8 @@ use tray_icon::{
     TrayIcon, TrayIconBuilder,
 };
 
-/// One frame at 60 Hz. Used to cap the main viewport's repaint rate.
+/// Upper bound on how often the main viewport asks for the next frame.
+/// 16 ms ≈ 60 Hz, which is the ceiling the DWM compositor can actually show.
 const TARGET_FRAME_TIME: Duration = Duration::from_millis(16);
 
 // ═══════════════════════════════════════════════════════════════
@@ -2269,6 +2270,25 @@ fn draw_spaced(
 
 impl SettingsState {
     fn draw_settings_ui(&mut self, ui: &mut egui::Ui) {
+        // ⚡ THE FIX ⚡
+        //
+        // egui's animation system fades widget hover highlights, tooltip
+        // popups, menu fades, and scroll deceleration over `animation_time`
+        // seconds (default 0.1 s). At 60 Hz that means every hover transition
+        // fires ~6 repaints; every tooltip another ~9. Combined with the
+        // settings window being focused (which routes all input to it), this
+        // easily produces 100+ presents per second on the shared event-loop
+        // thread. Windows' DWM compositor can only compose one frame per
+        // vsync across all windows — so the visualizer's own 60 Hz presents
+        // start getting dropped whenever the mouse moves over the settings
+        // window. That is the stutter you were seeing.
+        //
+        // Setting `animation_time = 0.0` makes every state change a single
+        // instant frame instead of a fade. Hovering a widget now costs exactly
+        // one present (not ~6), tooltips appear in one frame (not ~9), and the
+        // composite budget stays under DWM's ceiling.
+        ui.style_mut().animation_time = 0.0;
+
         let scale = self.config.settings_scale.clamp(0.75, 1.5);
 
         egui::SidePanel::left("settings_nav")
@@ -4245,8 +4265,6 @@ fn run_settings_viewport(
             });
     }
 
-    // Config only changes in response to real user input (clicks, drags,
-    // typing, wheel). Skip the expensive toml fingerprint on hover-only frames.
     let user_modified = ctx.input(|i| {
         i.pointer.any_down()
             || !i.keys_down.is_empty()
@@ -4446,23 +4464,21 @@ impl eframe::App for VisualizerApp {
         }
         self.was_settings_open = open;
 
-        // Cap the main viewport at ~60 fps. Without this the loop spins as
-        // fast as the CPU can drive it (~150-250 fps on typical hardware),
-        // because `moving` is basically always true while audio is playing.
-        // That busy-loop starves the settings viewport whenever it needs a
-        // paint on the shared event-loop thread, so the visualizer bars
-        // visibly stutter while the settings window has focus and is
-        // receiving input. The audio engine already calls `request_repaint`
-        // on every new BarFrame (default 60 Hz), so we get smooth
-        // audio-driven updates either way; we just stop racing the frame
-        // clock. If the current frame took longer than 16 ms, we still ask
-        // for an immediate repaint so we recover gracefully.
-        let elapsed = self.last_frame_time.elapsed();
-        let remaining = TARGET_FRAME_TIME.saturating_sub(elapsed);
-        if remaining.is_zero() {
-            ctx.request_repaint();
-        } else {
-            ctx.request_repaint_after(remaining);
+        // Cap the main viewport at ~60 fps. Without this, `moving` is
+        // effectively always true while audio plays, so the loop spins at
+        // whatever raw rate the machine can sustain (often 150-250 fps). That
+        // busy-loop leaves no headroom on the shared event-loop thread for
+        // the settings viewport's own paints, and — because Windows' DWM
+        // compositor can only present once per vsync across all windows —
+        // the visualizer's presents start being dropped whenever the settings
+        // window is also repainting on input. `request_repaint_after(16ms)` is
+        // a hard cap; audio-engine `request_repaint()` calls still interleave
+        // so we stay a full 60 Hz either way.
+        let moving = self.current_bars.iter().any(|&v| v > 0.0005)
+            || self.current_peaks.iter().any(|&v| v > 0.0005)
+            || self.config.color_mode == ColorMode::Animated;
+        if moving {
+            ctx.request_repaint_after(TARGET_FRAME_TIME);
         }
     }
 
