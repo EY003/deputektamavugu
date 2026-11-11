@@ -37,14 +37,33 @@ mod desktop_integration {
     use std::ffi::CString;
     use windows::Win32::UI::WindowsAndMessaging::{
         FindWindowA, FindWindowExA, GetWindowLongW, SetParent, SetWindowLongW, SetWindowPos,
+        SetLayeredWindowAttributes, EnumWindows,
         GWL_EXSTYLE, GWL_STYLE, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_FRAMECHANGED,
         WS_CHILD, WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPED, WS_POPUP,
-        SetClassLongPtrW, GCLP_HBRBACKGROUND,
+        SetClassLongPtrW, GCLP_HBRBACKGROUND, LWA_ALPHA,
     };
-    use windows::core::{s, PCSTR};
+    use windows::core::{s, PCSTR, BOOL, LPARAM, WPARAM};
 
-    /// Attach the given window (by title) to the Windows desktop.
-    /// The window will sit above desktop icons but below normal application windows.
+    // Helper to find the WorkerW window that hosts the wallpaper
+    unsafe extern "system" fn enum_window(window: HWND, ref_worker_w: LPARAM) -> BOOL {
+        unsafe {
+            let shell_dll_def_view = FindWindowExA(window, None, s!("SHELLDLL_DefView"), None)
+                .unwrap_or_default();
+            if !shell_dll_def_view.is_invalid() {
+                // Found the icon view. The WorkerW we want is the *next* sibling.
+                let worker_w = FindWindowExA(None, Some(window), s!("WorkerW"), None)
+                    .unwrap_or_default();
+                if !worker_w.is_invalid() {
+                    *(ref_worker_w.0 as *mut HWND) = worker_w;
+                    return false.into(); // Stop enumerating
+                }
+            }
+            true.into() // Continue
+        }
+    }
+
+    /// Attach the given window (by title) to the Windows desktop's wallpaper layer.
+    /// The window will sit above the desktop wallpaper but below normal application windows.
     pub unsafe fn attach_to_desktop(window_title: &str) -> Result<(), String> {
         let title_cstr = CString::new(window_title).map_err(|e| e.to_string())?;
         let title_pcstr = PCSTR::from_raw(title_cstr.as_ptr() as *const u8);
@@ -55,32 +74,53 @@ mod desktop_integration {
             return Err("target window handle is null".into());
         }
 
+        // 1. Find the top-level Progman window
         let progman = FindWindowA(s!("Progman"), None)
             .map_err(|e| format!("FindWindowA(Progman): {e}"))?;
         if progman.0.is_null() {
             return Err("Progman handle is null".into());
         }
 
-        let _ = FindWindowExA(progman, None, s!("SHELLDLL_DefView"), None);
+        // 2. Send the magic message to Progman to spawn the WorkerW if needed
+        // This message is 0x052C, a known undocumented trick.
+        use windows::Win32::UI::WindowsAndMessaging::{SendMessageTimeoutA, SMTO_NORMAL};
+        SendMessageTimeoutA(progman, 0x052C, WPARAM(0), LPARAM(0), SMTO_NORMAL, 1000, None);
 
-        // 1. Convert to child window
+        // 3. Enumerate windows to find the correct WorkerW sibling
+        let mut worker_w = HWND::default();
+        let _ = EnumWindows(Some(enum_window), LPARAM(&mut worker_w as *mut HWND as _));
+
+        // Fallback: if the WorkerW sibling wasn't found, try a direct child
+        if worker_w.is_invalid() {
+            worker_w = FindWindowExA(progman, None, s!("WorkerW"), None)
+                .unwrap_or_default();
+        }
+        if worker_w.is_invalid() {
+            return Err("Failed to find WorkerW window".into());
+        }
+
+        // 4. Modify styles for a child, layered window
         let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
         let new_style = (style & !(WS_POPUP.0 | WS_OVERLAPPED.0)) | WS_CHILD.0;
         SetWindowLongW(hwnd, GWL_STYLE, new_style as i32);
 
-        // 2. Explicitly ensure WS_EX_LAYERED is preserved
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
         let new_ex_style =
             (ex_style & !WS_EX_APPWINDOW.0) | WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0 | WS_EX_LAYERED.0;
         SetWindowLongW(hwnd, GWL_EXSTYLE, new_ex_style as i32);
 
-        // 3. Remove the default background brush so it doesn't paint black
+        // Remove background brush to prevent black painting
         SetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND, 0);
 
-        // 4. Parent to Progman
-        SetParent(hwnd, progman).map_err(|e| format!("SetParent: {e}"))?;
+        // 5. Parent to the WorkerW window
+        SetParent(hwnd, worker_w).map_err(|e| format!("SetParent: {e}"))?;
 
-        // 5. Force DWM to update the frame with the new styles
+        // 6. Explicitly set transparency attributes
+        // LWA_ALPHA with an opacity of 255 tells the DWM to respect the window's own alpha channel.
+        SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA)
+            .map_err(|e| format!("SetLayeredWindowAttributes: {e}"))?;
+
+        // 7. Force the DWM to update the window frame
         SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED)
             .map_err(|e| format!("SetWindowPos: {e}"))?;
