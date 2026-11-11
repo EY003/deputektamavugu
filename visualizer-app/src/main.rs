@@ -32,7 +32,6 @@ use tray_icon::{
 };
 
 /// Upper bound on how often the main viewport asks for the next frame.
-/// 16 ms ≈ 60 Hz, which is the ceiling the DWM compositor can actually show.
 const TARGET_FRAME_TIME: Duration = Duration::from_millis(16);
 
 // ═══════════════════════════════════════════════════════════════
@@ -643,6 +642,14 @@ struct VisualizerApp {
     settings_icon: egui::IconData,
     ui_cmd_rx: crossbeam_channel::Receiver<UiCmd>,
 
+    /// Tracks the current `WindowLevel` we've asked the root viewport to be at.
+    /// When settings is open we drop the main visualizer to `Normal` so it
+    /// lives in a *different* DWM composition band than the always-on-top
+    /// settings window. Two topmost windows sharing one band is the root
+    /// cause of the visualizer stutter: DWM can only compose that band at
+    /// one window per vsync, so heavy settings input starves the visualizer.
+    main_window_is_topmost: bool,
+
     _tray_icon: TrayIcon,
     _hotkey_manager: GlobalHotKeyManager,
 
@@ -779,6 +786,7 @@ impl VisualizerApp {
             was_settings_open: false,
             settings_icon: egui_icon,
             ui_cmd_rx,
+            main_window_is_topmost: true,
             _tray_icon: tray_icon,
             _hotkey_manager: hotkey_manager,
             mesh: MeshBuilder::new(),
@@ -2270,25 +2278,6 @@ fn draw_spaced(
 
 impl SettingsState {
     fn draw_settings_ui(&mut self, ui: &mut egui::Ui) {
-        // ⚡ THE FIX ⚡
-        //
-        // egui's animation system fades widget hover highlights, tooltip
-        // popups, menu fades, and scroll deceleration over `animation_time`
-        // seconds (default 0.1 s). At 60 Hz that means every hover transition
-        // fires ~6 repaints; every tooltip another ~9. Combined with the
-        // settings window being focused (which routes all input to it), this
-        // easily produces 100+ presents per second on the shared event-loop
-        // thread. Windows' DWM compositor can only compose one frame per
-        // vsync across all windows — so the visualizer's own 60 Hz presents
-        // start getting dropped whenever the mouse moves over the settings
-        // window. That is the stutter you were seeing.
-        //
-        // Setting `animation_time = 0.0` makes every state change a single
-        // instant frame instead of a fade. Hovering a widget now costs exactly
-        // one present (not ~6), tooltips appear in one frame (not ~9), and the
-        // composite budget stays under DWM's ceiling.
-        ui.style_mut().animation_time = 0.0;
-
         let scale = self.config.settings_scale.clamp(0.75, 1.5);
 
         egui::SidePanel::left("settings_nav")
@@ -4435,6 +4424,35 @@ impl eframe::App for VisualizerApp {
         }
 
         let open = self.settings_open.load(Ordering::Relaxed);
+
+        // ⚡ THE FIX ⚡
+        //
+        // When both windows are `always_on_top`, DWM composites them in the
+        // SAME band. That band is only refreshed once per vsync, so when the
+        // focused settings window repaints on every mouse move, it consumes
+        // the entire per-vsync slot and the visualizer's presents get
+        // dropped → visible stutter. By moving the main window to
+        // `WindowLevel::Normal` while settings is open, the two windows end
+        // up in DIFFERENT composition bands, each of which gets its own
+        // per-vsync slot. Neither starves the other, regardless of how many
+        // times the focused settings window repaints on input.
+        //
+        // When settings closes, we put the main window back to `AlwaysOnTop`
+        // so it keeps behaving as an overlay.
+        if open {
+            if self.main_window_is_topmost {
+                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                    egui::viewport::WindowLevel::Normal,
+                ));
+                self.main_window_is_topmost = false;
+            }
+        } else if !self.main_window_is_topmost {
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                egui::viewport::WindowLevel::AlwaysOnTop,
+            ));
+            self.main_window_is_topmost = true;
+        }
+
         let settings_id = egui::ViewportId::from_hash_of("settings");
         if open {
             let scale = self.config.settings_scale.clamp(0.75, 1.5);
@@ -4464,16 +4482,6 @@ impl eframe::App for VisualizerApp {
         }
         self.was_settings_open = open;
 
-        // Cap the main viewport at ~60 fps. Without this, `moving` is
-        // effectively always true while audio plays, so the loop spins at
-        // whatever raw rate the machine can sustain (often 150-250 fps). That
-        // busy-loop leaves no headroom on the shared event-loop thread for
-        // the settings viewport's own paints, and — because Windows' DWM
-        // compositor can only present once per vsync across all windows —
-        // the visualizer's presents start being dropped whenever the settings
-        // window is also repainting on input. `request_repaint_after(16ms)` is
-        // a hard cap; audio-engine `request_repaint()` calls still interleave
-        // so we stay a full 60 Hz either way.
         let moving = self.current_bars.iter().any(|&v| v > 0.0005)
             || self.current_peaks.iter().any(|&v| v > 0.0005)
             || self.config.color_mode == ColorMode::Animated;
