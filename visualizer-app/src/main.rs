@@ -350,6 +350,80 @@ fn hash_gradient_source<H: std::hash::Hasher>(s: &GradientSource, h: &mut H) {
 
 fn accent() -> egui::Color32 { egui::Color32::from_rgb(0xB7, 0x41, 0x0E) }
 
+/// Central style/theme applied to the settings panel. Handles:
+///  - menu scale
+///  - white body text
+///  - accent-colored selection (replacing egui's default blue)
+///  - modern rounded widgets with accent handles
+fn apply_settings_style(ui: &mut egui::Ui, scale: f32) {
+    let accent = accent();
+
+    {
+        let style = ui.style_mut();
+        style.text_styles.insert(
+            egui::TextStyle::Body,
+            egui::FontId::proportional(14.0),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Button,
+            egui::FontId::proportional(14.0),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Small,
+            egui::FontId::proportional(12.0),
+        );
+        style.text_styles.insert(
+            egui::TextStyle::Heading,
+            egui::FontId::proportional(18.0),
+        );
+
+        style.spacing.item_spacing *= scale;
+        style.spacing.button_padding *= scale;
+        style.spacing.slider_width *= scale;
+        style.spacing.combo_width *= scale;
+
+        for (_, font) in style.text_styles.iter_mut() {
+            font.size *= scale;
+        }
+    }
+
+    let v = ui.visuals_mut();
+
+    // Settings text is mostly white; help/description text keeps its own grey.
+    v.override_text_color = Some(egui::Color32::from_rgb(238, 238, 238));
+
+    // Replace egui's default blue selection with the visualizer accent.
+    v.selection.bg_fill = accent;
+    v.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+
+    // Modern dark widgets with rounded corners and accent handles.
+    v.widgets.inactive.bg_fill = egui::Color32::from_rgb(30, 30, 30);
+    v.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(30, 30, 30);
+    v.widgets.inactive.bg_stroke =
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(55, 55, 55));
+    v.widgets.inactive.fg_stroke =
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(220, 220, 220));
+
+    v.widgets.hovered.bg_fill = egui::Color32::from_rgb(45, 45, 45);
+    v.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(45, 45, 45);
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, accent);
+    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+
+    v.widgets.active.bg_fill = accent;
+    v.widgets.active.weak_bg_fill = accent;
+    v.widgets.active.bg_stroke = egui::Stroke::new(1.0, accent);
+    v.widgets.active.fg_stroke = egui::Stroke::new(1.5, egui::Color32::WHITE);
+
+    v.widgets.inactive.rounding = egui::Rounding::same(6.0);
+    v.widgets.hovered.rounding = egui::Rounding::same(6.0);
+    v.widgets.active.rounding = egui::Rounding::same(6.0);
+    v.widgets.open.rounding = egui::Rounding::same(6.0);
+    v.widgets.noninteractive.rounding = egui::Rounding::same(6.0);
+
+    v.window_rounding = egui::Rounding::same(8.0);
+    v.menu_rounding = egui::Rounding::same(6.0);
+}
+
 fn section_header(ui: &mut egui::Ui, title: &str) {
     ui.add_space(8.0);
     ui.label(egui::RichText::new(title).size(16.0).strong().color(accent()));
@@ -467,7 +541,11 @@ fn combo_reset<T: PartialEq + Copy + 'static>(
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsTab {
-    Visualizer, Colors, Audio, TrackInfo, Appearance, Performance,
+    Visualizer,
+    Colors,
+    Audio,
+    TrackInfo,
+    Display,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -490,12 +568,9 @@ const SEARCH_INDEX: &[(SettingsTab, &str, &[&str])] = &[
     (SettingsTab::Audio, "Ballistics", &["attack", "decay", "gravity", "peak"]),
     (SettingsTab::Audio, "Rhythm", &["beat", "bpm", "tempo", "phase"]),
     (SettingsTab::TrackInfo, "Cover Art", &["cover", "art", "album"]),
-    (SettingsTab::TrackInfo, "Text", &["title", "artist", "font", "text"]),
-    (SettingsTab::TrackInfo, "Shadow", &["shadow", "blur"]),
-    (SettingsTab::TrackInfo, "Outline", &["outline", "border"]),
-    (SettingsTab::Appearance, "Background", &["background", "bg", "opacity"]),
-    (SettingsTab::Appearance, "UI", &["scale", "size", "help", "launch"]),
-    (SettingsTab::Performance, "Performance", &["fps", "vsync", "frame"]),
+    (SettingsTab::TrackInfo, "Text", &["title", "artist", "font", "text", "shadow", "outline"]),
+    (SettingsTab::Display, "Background", &["background", "bg", "opacity"]),
+    (SettingsTab::Display, "Menu & Display", &["scale", "size", "help", "launch", "fps", "vsync", "frame"]),
 ];
 
 // ═══════════════════════════════════════════════════════════════
@@ -579,7 +654,6 @@ struct SettingsState {
     pending_audio_preset_delete: Option<usize>,
     active_palettes: ActivePalettes,
     last_bpm: f32,
-    current_fps: f32,
     system_fonts: Vec<(String, String)>,
 }
 
@@ -745,7 +819,6 @@ impl VisualizerApp {
             pending_audio_preset_delete: None,
             active_palettes: ActivePalettes::default(),
             last_bpm: 0.0,
-            current_fps: 0.0,
             system_fonts: list_system_fonts(),
         }));
 
@@ -889,7 +962,6 @@ impl VisualizerApp {
                 let artist_font = egui::FontId::new(cfg.artist_font_size, family.clone());
                 let title_font = egui::FontId::new(cfg.title_font_size, family);
 
-                // Accurately measure the text width so the bounding box is tight!
                 let artist_w = if cfg.show_artist && !info.artist.is_empty() {
                     ctx.fonts(|f| f.layout_no_wrap(info.artist.clone(), artist_font.clone(), egui::Color32::WHITE).size().x)
                 } else { 0.0 };
@@ -932,7 +1004,6 @@ impl VisualizerApp {
         let min = egui::vec2(80.0, 60.0);
         let size = bbox.size().max(min);
         let center = bbox.center();
-        // Do NOT intersect with monitor here, otherwise things get clipped when Mirrored is wide.
         egui::Rect::from_center_size(center, size)
     }
 
@@ -1658,7 +1729,6 @@ impl VisualizerApp {
         let stride = bar_width + gap;
         let total_size = visual_num_bars as f32 * stride - gap;
         let max_h = self.config.max_bar_height;
-        let radius = self.config.bar_radius;
         let freq_dir = self.config.frequency_direction;
         let dir = self.config.visualizer_direction;
         let is_smooth = self.config.bar_interpolation == BarInterpolation::Smooth;
@@ -1815,20 +1885,61 @@ impl VisualizerApp {
             painter.add(egui::Shape::mesh(self.mesh.take_mesh()));
         }
 
+        // ── Outlines ─────────────────────────────────────────
         if outline_on {
             let oc = self.config.visualizer_outline_color;
             let stroke_color = self.apply_vis(egui::Color32::from_rgb(oc[0], oc[1], oc[2]));
             let stroke = egui::Stroke::new(self.config.visualizer_outline_thickness, stroke_color);
-            for i in 0..visual_num_bars {
-                let idx = frequency_index(i, base_num_bars, freq_dir);
-                let len = (self.current_bars[idx] * rect_len)
-                    .min(if max_h > 0.0 { max_h } else { rect_len });
-                if len <= 0.5 {
-                    continue;
+
+            if is_smooth {
+                // Smooth bars: draw only the outer contour, excluding the base.
+                if visual_num_bars > 0 {
+                    let first_edge = start_pos;
+                    let last_i = visual_num_bars - 1;
+                    let last_edge = start_pos + last_i as f32 * stride + bar_width;
+
+                    let first_idx = frequency_index(0, base_num_bars, freq_dir);
+                    let last_idx = frequency_index(last_i, base_num_bars, freq_dir);
+                    let first_len = (self.current_bars[first_idx] * rect_len)
+                        .min(if max_h > 0.0 { max_h } else { rect_len });
+                    let last_len = (self.current_bars[last_idx] * rect_len)
+                        .min(if max_h > 0.0 { max_h } else { rect_len });
+
+                    let mut points: Vec<egui::Pos2> =
+                        Vec::with_capacity(visual_num_bars + 4);
+
+                    // Left side of the contour (from base to top).
+                    points.push(bar_vertex(dir, first_edge, anchor, first_len, 0.0));
+                    points.push(bar_vertex(dir, first_edge, anchor, first_len, 1.0));
+
+                    // Top contour through every bar's tip.
+                    for i in 0..visual_num_bars {
+                        let idx = frequency_index(i, base_num_bars, freq_dir);
+                        let len = (self.current_bars[idx] * rect_len)
+                            .min(if max_h > 0.0 { max_h } else { rect_len });
+                        let perp = start_pos + i as f32 * stride + bar_width / 2.0;
+                        points.push(bar_vertex(dir, perp, anchor, len, 1.0));
+                    }
+
+                    // Right side of the contour (from top to base).
+                    points.push(bar_vertex(dir, last_edge, anchor, last_len, 1.0));
+                    points.push(bar_vertex(dir, last_edge, anchor, last_len, 0.0));
+
+                    painter.add(egui::Shape::line(points, stroke));
                 }
-                let perp = start_pos + i as f32 * stride;
-                let rect = self.bar_rect(dir, perp, bar_width, anchor, len);
-                painter.rect_stroke(rect, radius, stroke);
+            } else {
+                // Step bars: square outlines (radius = 0) match the square mesh.
+                for i in 0..visual_num_bars {
+                    let idx = frequency_index(i, base_num_bars, freq_dir);
+                    let len = (self.current_bars[idx] * rect_len)
+                        .min(if max_h > 0.0 { max_h } else { rect_len });
+                    if len <= 0.5 {
+                        continue;
+                    }
+                    let perp = start_pos + i as f32 * stride;
+                    let rect = self.bar_rect(dir, perp, bar_width, anchor, len);
+                    painter.rect_stroke(rect, 0.0, stroke);
+                }
             }
         }
 
@@ -2227,147 +2338,129 @@ impl SettingsState {
     fn draw_settings_ui(&mut self, ui: &mut egui::Ui) {
         let scale = self.config.settings_scale.clamp(0.75, 1.5);
 
-        egui::SidePanel::left("settings_nav")
-            .resizable(false)
-            .exact_width(140.0)
-            .frame(
-                egui::Frame::none()
-                    .fill(egui::Color32::BLACK)
-                    .inner_margin(egui::Margin::same(8.0)),
-            )
-            .show_inside(ui, |ui| {
-                self.draw_sidebar(ui);
-            });
+        apply_settings_style(ui, scale);
 
-        egui::CentralPanel::default()
-            .frame(
-                egui::Frame::none()
-                    .fill(egui::Color32::BLACK)
-                    .inner_margin(egui::Margin::same(12.0)),
-            )
-            .show_inside(ui, |ui| {
-                ui.style_mut()
-                    .text_styles
-                    .insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
-                ui.style_mut()
-                    .text_styles
-                    .insert(egui::TextStyle::Button, egui::FontId::proportional(14.0));
-                ui.style_mut()
-                    .text_styles
-                    .insert(egui::TextStyle::Small, egui::FontId::proportional(12.0));
-                ui.style_mut()
-                    .text_styles
-                    .insert(egui::TextStyle::Heading, egui::FontId::proportional(18.0));
+        self.draw_top_nav(ui);
+        ui.add_space(4.0);
+        ui.separator();
+        ui.add_space(2.0);
 
-                ui.style_mut().spacing.item_spacing *= scale;
-                ui.style_mut().spacing.button_padding *= scale;
-                ui.style_mut().spacing.slider_width *= scale;
-                ui.style_mut().spacing.combo_width *= scale;
-
-                for (_, font) in ui.style_mut().text_styles.iter_mut() {
-                    font.size *= scale;
-                }
-
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| match self.settings_tab {
-                        SettingsTab::Visualizer => self.tab_visualizer(ui),
-                        SettingsTab::Colors => self.tab_colors(ui),
-                        SettingsTab::Audio => self.tab_audio(ui),
-                        SettingsTab::TrackInfo => self.tab_track_info(ui),
-                        SettingsTab::Appearance => self.tab_appearance(ui),
-                        SettingsTab::Performance => self.tab_performance(ui),
-                    });
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| match self.settings_tab {
+                SettingsTab::Visualizer => self.tab_visualizer(ui),
+                SettingsTab::Colors => self.tab_colors(ui),
+                SettingsTab::Audio => self.tab_audio(ui),
+                SettingsTab::TrackInfo => self.tab_track_info(ui),
+                SettingsTab::Display => self.tab_display(ui),
             });
     }
 
-    fn draw_sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
-        ui.label(egui::RichText::new("Settings").size(16.0).strong().color(accent()));
-        ui.add_space(8.0);
+    fn draw_top_nav(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Settings")
+                    .size(16.0)
+                    .strong()
+                    .color(accent()),
+            );
 
-        ui.add(
-            egui::TextEdit::singleline(&mut self.settings_search)
-                .hint_text("Search…")
-                .desired_width(f32::INFINITY),
-        );
-        ui.add_space(6.0);
+            ui.separator();
+
+            let tabs = [
+                (SettingsTab::Visualizer, "Visualizer"),
+                (SettingsTab::Colors, "Colors"),
+                (SettingsTab::Audio, "Audio"),
+                (SettingsTab::TrackInfo, "Track Info"),
+                (SettingsTab::Display, "Display"),
+            ];
+
+            for (tab, label) in tabs {
+                let selected = self.settings_tab == tab;
+                let text = if selected {
+                    egui::RichText::new(label)
+                        .size(13.0)
+                        .strong()
+                        .color(egui::Color32::WHITE)
+                } else {
+                    egui::RichText::new(label)
+                        .size(13.0)
+                        .color(egui::Color32::from_gray(210))
+                };
+
+                if ui
+                    .add(egui::SelectableLabel::new(selected, text))
+                    .clicked()
+                {
+                    self.settings_tab = tab;
+                }
+            }
+
+            ui.with_layout(
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("Close").size(12.0),
+                            )
+                            .frame(false),
+                        )
+                        .clicked()
+                    {
+                        self.close_requested = true;
+                        self.config.save();
+                    }
+
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("Reset All")
+                                    .size(12.0)
+                                    .color(egui::Color32::from_rgb(255, 100, 100)),
+                            )
+                            .frame(false),
+                        )
+                        .clicked()
+                    {
+                        self.config = AppConfig::default();
+                        self.audio_dirty = true;
+                    }
+                },
+            );
+        });
+
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.settings_search)
+                    .hint_text("Search…")
+                    .desired_width(180.0),
+            );
+        });
 
         let query = self.settings_search.trim().to_lowercase();
         if !query.is_empty() {
-            ui.label(egui::RichText::new("Results").small().weak());
-            let mut any = false;
-            for (tab, name, keywords) in SEARCH_INDEX {
-                let hit = name.to_lowercase().contains(&query)
-                    || keywords.iter().any(|k| k.contains(&query));
-                if hit {
-                    any = true;
-                    if ui.small_button(*name).clicked() {
-                        self.settings_tab = *tab;
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Results:").small().weak());
+
+                let mut any = false;
+                for (tab, name, keywords) in SEARCH_INDEX {
+                    let hit = name.to_lowercase().contains(&query)
+                        || keywords.iter().any(|k| k.contains(&query));
+
+                    if hit {
+                        any = true;
+                        if ui.small_button(*name).clicked() {
+                            self.settings_tab = *tab;
+                        }
                     }
                 }
-            }
-            if !any {
-                ui.label(egui::RichText::new("No matches").small().weak());
-            }
-            ui.add_space(6.0);
-            ui.separator();
-        }
 
-        ui.add_space(4.0);
-        let tabs = [
-            (SettingsTab::Visualizer, "Visualizer"),
-            (SettingsTab::Colors, "Colors"),
-            (SettingsTab::Audio, "Audio"),
-            (SettingsTab::TrackInfo, "Track Info"),
-            (SettingsTab::Appearance, "Appearance"),
-            (SettingsTab::Performance, "Performance"),
-        ];
-        for (tab, label) in tabs {
-            let selected = self.settings_tab == tab;
-            let mut text = egui::RichText::new(label).size(13.0);
-            if selected {
-                text = text.strong().color(accent());
-            }
-            if ui
-                .add_sized(
-                    [ui.available_width(), 26.0],
-                    egui::SelectableLabel::new(selected, text),
-                )
-                .clicked()
-            {
-                self.settings_tab = tab;
-            }
+                if !any {
+                    ui.label(egui::RichText::new("No matches").small().weak());
+                }
+            });
         }
-
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-            ui.add_space(8.0);
-            if ui
-                .add_sized(
-                    [ui.available_width(), 24.0],
-                    egui::Button::new(egui::RichText::new("Close").size(13.0)).frame(false),
-                )
-                .clicked()
-            {
-                self.close_requested = true;
-                self.config.save();
-            }
-            if ui
-                .add_sized(
-                    [ui.available_width(), 24.0],
-                    egui::Button::new(
-                        egui::RichText::new("Reset All")
-                            .size(13.0)
-                            .color(egui::Color32::from_rgb(255, 100, 100)),
-                    )
-                    .frame(false),
-                )
-                .clicked()
-            {
-                self.config = AppConfig::default();
-                self.audio_dirty = true;
-            }
-        });
     }
 
     fn tab_visualizer(&mut self, ui: &mut egui::Ui) {
@@ -2511,7 +2604,7 @@ impl SettingsState {
             help_text(
                 ui,
                 self.config.show_help_text,
-                "Outlines follow the visualizer's shape. In Smooth mode, a single perimeter is drawn.",
+                "Outlines follow the visualizer's shape. In Smooth mode, only the outer contour is drawn.",
             );
         }
     }
@@ -3831,7 +3924,9 @@ impl SettingsState {
         checkbox_reset(ui, &mut cfg.show_cover_art, "Show Cover Art", true);
         if cfg.show_cover_art {
             ui.horizontal(|ui| {
-                let r = ui.add(egui::Slider::new(&mut cfg.cover_size, 40.0..=600.0).text("Size (px)"));
+                let r = ui.add(
+                    egui::Slider::new(&mut cfg.cover_size, 40.0..=600.0).text("Size (px)"),
+                );
                 if r.secondary_clicked() {
                     cfg.cover_size = DEFAULT_COVER_SIZE;
                 }
@@ -3851,7 +3946,7 @@ impl SettingsState {
                 if r.secondary_clicked() {
                     cfg.cover_x_offset = 0.0;
                 }
-                reset_btn(ui, (cfg.cover_x_offset).abs() > 1e-3, || {
+                reset_btn(ui, cfg.cover_x_offset.abs() > 1e-3, || {
                     cfg.cover_x_offset = 0.0
                 });
             });
@@ -3867,21 +3962,30 @@ impl SettingsState {
                 if r.secondary_clicked() {
                     cfg.cover_y_offset = 0.0;
                 }
-                reset_btn(ui, (cfg.cover_y_offset).abs() > 1e-3, || {
+                reset_btn(ui, cfg.cover_y_offset.abs() > 1e-3, || {
                     cfg.cover_y_offset = 0.0
                 });
             });
-            slider_u8(ui, &mut cfg.cover_opacity, "Cover Art Opacity", DEFAULT_COVER_OPACITY);
+            slider_u8(
+                ui,
+                &mut cfg.cover_opacity,
+                "Cover Art Opacity",
+                DEFAULT_COVER_OPACITY,
+            );
         }
 
         section_header(ui, "Song Info Text");
+
+        // Content
         ui.horizontal(|ui| {
             checkbox_reset(ui, &mut cfg.show_title, "Show Title", true);
             checkbox_reset(ui, &mut cfg.show_artist, "Show Artist", true);
         });
+
         ui.horizontal(|ui| {
             let r = ui.add(
-                egui::Slider::new(&mut cfg.title_font_size, 6.0..=120.0).text("Title Font Size"),
+                egui::Slider::new(&mut cfg.title_font_size, 6.0..=120.0)
+                    .text("Title Font Size"),
             );
             if r.secondary_clicked() {
                 cfg.title_font_size = DEFAULT_TITLE_FONT_SIZE;
@@ -3890,9 +3994,11 @@ impl SettingsState {
                 cfg.title_font_size = DEFAULT_TITLE_FONT_SIZE
             });
         });
+
         ui.horizontal(|ui| {
             let r = ui.add(
-                egui::Slider::new(&mut cfg.artist_font_size, 6.0..=120.0).text("Artist Font Size"),
+                egui::Slider::new(&mut cfg.artist_font_size, 6.0..=120.0)
+                    .text("Artist Font Size"),
             );
             if r.secondary_clicked() {
                 cfg.artist_font_size = DEFAULT_ARTIST_FONT_SIZE;
@@ -3901,6 +4007,7 @@ impl SettingsState {
                 cfg.artist_font_size = DEFAULT_ARTIST_FONT_SIZE
             });
         });
+
         ui.horizontal(|ui| {
             ui.label("Font:");
             let selected_label = match &cfg.font_path {
@@ -3927,6 +4034,7 @@ impl SettingsState {
                     }
                 });
         });
+
         ui.horizontal(|ui| {
             ui.label("Custom path:");
             let mut path_str = cfg.font_path.clone().unwrap_or_default();
@@ -3939,25 +4047,45 @@ impl SettingsState {
             }
         });
 
-        section_header(ui, "Text Color");
+        // Color
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new("Color")
+                .strong()
+                .color(egui::Color32::from_gray(180)),
+        );
         ui.horizontal(|ui| {
             ui.radio_value(&mut cfg.color_mode, TrackTextColorMode::Static, "Static");
-            ui.radio_value(&mut cfg.color_mode, TrackTextColorMode::Visualizer, "Visualizer Color");
+            ui.radio_value(
+                &mut cfg.color_mode,
+                TrackTextColorMode::Visualizer,
+                "Visualizer Color",
+            );
         });
         if cfg.color_mode == TrackTextColorMode::Static {
             color_edit_reset(ui, &mut cfg.static_color, "Color", [220, 220, 220]);
         }
         slider_u8(ui, &mut cfg.opacity, "Text Opacity", 255);
 
-        section_header(ui, "Text Layout");
+        // Layout
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new("Layout")
+                .strong()
+                .color(egui::Color32::from_gray(180)),
+        );
         ui.horizontal(|ui| {
             ui.label("Alignment:");
             ui.radio_value(&mut cfg.alignment, TrackTextAlign::Left, "Left");
             ui.radio_value(&mut cfg.alignment, TrackTextAlign::Center, "Center");
             ui.radio_value(&mut cfg.alignment, TrackTextAlign::Right, "Right");
         });
+
         ui.horizontal(|ui| {
-            let r = ui.add(egui::Slider::new(&mut cfg.letter_spacing, -5.0..=20.0).text("Letter Spacing (px)"));
+            let r = ui.add(
+                egui::Slider::new(&mut cfg.letter_spacing, -5.0..=20.0)
+                    .text("Letter Spacing (px)"),
+            );
             if r.secondary_clicked() {
                 cfg.letter_spacing = 0.0;
             }
@@ -3965,8 +4093,11 @@ impl SettingsState {
                 cfg.letter_spacing = 0.0
             });
         });
+
         ui.horizontal(|ui| {
-            let r = ui.add(egui::Slider::new(&mut cfg.line_height, 0.5..=3.0).text("Line Height"));
+            let r = ui.add(
+                egui::Slider::new(&mut cfg.line_height, 0.5..=3.0).text("Line Height"),
+            );
             if r.secondary_clicked() {
                 cfg.line_height = 1.3;
             }
@@ -3974,6 +4105,7 @@ impl SettingsState {
                 cfg.line_height = 1.3
             });
         });
+
         ui.horizontal(|ui| {
             ui.label("Text X Offset:");
             let r = ui.add(
@@ -3990,6 +4122,7 @@ impl SettingsState {
                 cfg.text_x_offset = 0.0
             });
         });
+
         ui.horizontal(|ui| {
             ui.label("Text Y Offset:");
             let r = ui.add(
@@ -4007,7 +4140,13 @@ impl SettingsState {
             });
         });
 
-        section_header(ui, "Shadow");
+        // Shadow
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new("Shadow")
+                .strong()
+                .color(egui::Color32::from_gray(180)),
+        );
         checkbox_reset(ui, &mut cfg.shadow_enabled, "Enable Shadow", true);
         if cfg.shadow_enabled {
             slider_f32(ui, &mut cfg.shadow_offset_x, -30.0..=30.0, "Shadow X Offset", 2.0);
@@ -4016,7 +4155,13 @@ impl SettingsState {
             color_edit_reset(ui, &mut cfg.shadow_color, "Shadow Color", [0, 0, 0]);
         }
 
-        section_header(ui, "Outline");
+        // Outline
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new("Outline")
+                .strong()
+                .color(egui::Color32::from_gray(180)),
+        );
         checkbox_reset(ui, &mut cfg.outline_enabled, "Enable Outline", false);
         if cfg.outline_enabled {
             slider_f32(ui, &mut cfg.outline_thickness, 0.1..=6.0, "Outline Thickness", 1.0);
@@ -4024,15 +4169,20 @@ impl SettingsState {
         }
     }
 
-    fn tab_appearance(&mut self, ui: &mut egui::Ui) {
+    fn tab_display(&mut self, ui: &mut egui::Ui) {
         use cfg::*;
 
         section_header(ui, "Background");
         color_edit_reset(ui, &mut self.config.bg_color, "Background Color", [0, 0, 0]);
-        slider_u8(ui, &mut self.config.bg_opacity, "Background Opacity", DEFAULT_BG_OPACITY);
+        slider_u8(
+            ui,
+            &mut self.config.bg_opacity,
+            "Background Opacity",
+            DEFAULT_BG_OPACITY,
+        );
         help_text(ui, self.config.show_help_text, "0 = fully transparent overlay.");
 
-        section_header(ui, "Menu");
+        section_header(ui, "Menu & Display");
         ui.horizontal(|ui| {
             ui.label("Menu Scale:");
             let mut current_scale = self.config.settings_scale;
@@ -4051,6 +4201,7 @@ impl SettingsState {
                 self.config.settings_scale = 1.0
             });
         });
+
         checkbox_reset(
             ui,
             &mut self.config.open_settings_on_launch,
@@ -4063,13 +4214,14 @@ impl SettingsState {
             "Show Inline Help Text",
             DEFAULT_SHOW_HELP_TEXT,
         );
-    }
 
-    fn tab_performance(&mut self, ui: &mut egui::Ui) {
-        section_header(ui, "Display");
+        ui.add_space(8.0);
         checkbox_reset(ui, &mut self.config.show_fps, "Show FPS Counter", false);
-        ui.label(format!("Current FPS: {:.1}", self.current_fps));
-        ui.add_space(6.0);
+        help_text(
+            ui,
+            self.config.show_help_text,
+            "Shows the current frame rate in the top-left corner of the visualizer.",
+        );
     }
 
     fn draw_dynamic_palette_settings(
@@ -4170,29 +4322,30 @@ impl VisualizerApp {
         let shared = self.shared.clone();
         let mut st = lock_state(&shared);
         st.last_bpm = self.last_bpm;
-        st.current_fps = self.current_fps;
 
         let ov = origin.to_vec2();
         let scale = st.config.settings_scale.clamp(0.75, 1.5);
         let scale_key = (scale * 100.0).round() as i32;
-        let default_size = (egui::vec2(560.0, 720.0) * scale)
+        let default_size = (egui::vec2(760.0, 560.0) * scale)
             .min(monitor.size() - egui::vec2(40.0, 80.0))
-            .max(egui::vec2(380.0, 300.0));
+            .max(egui::vec2(520.0, 320.0));
 
         let frame = egui::Frame::window(&ctx.style())
             .fill(egui::Color32::BLACK)
-            .inner_margin(egui::Margin::same(0.0));
+            .stroke(egui::Stroke::NONE)
+            .shadow(egui::epaint::Shadow::NONE)
+            .rounding(8.0)
+            .inner_margin(egui::Margin::symmetric(12.0, 10.0));
 
-        let mut open = true;
         let mut win = egui::Window::new("Rust Visualizer — Settings")
             // New id per scale => egui forgets the old size and applies `default_size`.
             .id(egui::Id::new(("settings_window", scale_key)))
-            .open(&mut open)
+            .title_bar(false)
             .frame(frame)
             .collapsible(false)
             .resizable(true)
             .default_size(default_size)
-            .min_size(egui::vec2(380.0, 300.0))
+            .min_size(egui::vec2(520.0, 320.0))
             .default_pos(monitor.center() - default_size / 2.0 - ov);
 
         // egui stores the panel position in window-local coordinates. When the
@@ -4256,8 +4409,9 @@ impl VisualizerApp {
         let changed = st.audio_dirty || fp != st.last_fingerprint;
         st.last_fingerprint = fp;
 
-        // `!open` = title-bar close button; `close_requested` = in-UI close button.
-        let wants_close = st.close_requested || !open;
+        // `close_requested` is set by the in-UI close button; there is no
+        // title-bar X because the window uses `title_bar(false)`.
+        let wants_close = st.close_requested;
         st.close_requested = false;
         if wants_close {
             st.config.save();
