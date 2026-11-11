@@ -48,12 +48,15 @@ mod desktop_integration {
     // Helper to find the WorkerW window that hosts the wallpaper
     unsafe extern "system" fn enum_window(window: HWND, ref_worker_w: LPARAM) -> BOOL {
         unsafe {
-            let shell_dll_def_view = FindWindowExA(window, None, s!("SHELLDLL_DefView"), None)
+            // Pass HWND::default() for NULL
+            let shell_dll_def_view = FindWindowExA(window, HWND::default(), s!("SHELLDLL_DefView"), None)
                 .unwrap_or_default();
+                
             if !shell_dll_def_view.is_invalid() {
                 // Found the icon view. The WorkerW we want is the *next* sibling.
-                let worker_w = FindWindowExA(None, Some(window), s!("WorkerW"), None)
+                let worker_w = FindWindowExA(HWND::default(), window, s!("WorkerW"), None)
                     .unwrap_or_default();
+                    
                 if !worker_w.is_invalid() {
                     *(ref_worker_w.0 as *mut HWND) = worker_w;
                     return false.into(); // Stop enumerating
@@ -69,6 +72,7 @@ mod desktop_integration {
         let title_cstr = CString::new(window_title).map_err(|e| e.to_string())?;
         let title_pcstr = PCSTR::from_raw(title_cstr.as_ptr() as *const u8);
 
+        // Find our window
         let hwnd = FindWindowA(None, title_pcstr)
             .map_err(|e| format!("FindWindowA(target): {e}"))?;
         if hwnd.is_invalid() {
@@ -83,7 +87,6 @@ mod desktop_integration {
         }
 
         // 2. Send the magic message to Progman to spawn the WorkerW if needed
-        // The return value is a usize (handle to result), we can ignore it safely.
         let _ = SendMessageTimeoutA(progman, 0x052C, WPARAM(0), LPARAM(0), SMTO_NORMAL, 1000, None);
 
         // 3. Enumerate windows to find the correct WorkerW sibling
@@ -92,7 +95,7 @@ mod desktop_integration {
 
         // Fallback: if the WorkerW sibling wasn't found, try a direct child
         if worker_w.is_invalid() {
-            worker_w = FindWindowExA(progman, None, s!("WorkerW"), None)
+            worker_w = FindWindowExA(progman, HWND::default(), s!("WorkerW"), None)
                 .unwrap_or_default();
         }
         if worker_w.is_invalid() {
