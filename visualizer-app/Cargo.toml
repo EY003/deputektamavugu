@@ -16,13 +16,6 @@ crossbeam-channel = "0.5"
 glow = "0.13"
 arc-swap = "1.7"
 
-[dependencies.windows]
-version = "0.58"
-features = [
-    "Win32_Foundation",
-    "Win32_UI_WindowsAndMessaging",
-]
-
 [build-dependencies]
 winres = "0.1"
 
