@@ -21,6 +21,8 @@
 //!   has `WS_EX_APPWINDOW` cleared.  Winit rewrites the extended style whenever
 //!   the click-through flag is toggled, so the flags are re-applied from
 //!   `WM_STYLECHANGING`.
+//! * `WM_ERASEBKGND` is intercepted to prevent Windows from painting the
+//!   background black when the window is focused.
 
 use eframe::egui;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
@@ -35,8 +37,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowExW, GetCursorPos, GetWindow, GetWindowLongPtrW, GetWindowTextW,
     GetWindowThreadProcessId, IsWindow, IsWindowVisible, SetWindowLongPtrW, SetWindowPos,
     ShowWindow, GWL_EXSTYLE, GW_HWNDPREV, STYLESTRUCT, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SW_HIDE, SW_SHOWNA, WINDOWPOS, WM_STYLECHANGING, WM_WINDOWPOSCHANGING,
-    WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    SWP_NOZORDER, SW_HIDE, SW_SHOWNA, WINDOWPOS, WM_ERASEBKGND, WM_STYLECHANGING,
+    WM_WINDOWPOSCHANGING, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
 
 /// Hide the overlay from the taskbar / Alt-Tab (also keeps it from being
@@ -146,6 +148,10 @@ unsafe extern "system" fn subclass_proc(
     _ref_data: usize,
 ) -> LRESULT {
     match msg {
+        // Prevent the OS from painting a solid black background when focused.
+        WM_ERASEBKGND => {
+            return 1;
+        }
         // Whenever something (activation, click, ...) tries to re-order *our*
         // window, redirect it to "directly above the desktop icons".
         WM_WINDOWPOSCHANGING => {
