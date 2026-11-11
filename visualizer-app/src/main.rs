@@ -3,19 +3,21 @@
 use eframe::egui;
 use image::DynamicImage;
 use std::f32::consts::TAU;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use arc_swap::ArcSwap;
 use visualizer_core::{
     audio::{AudioEngine, BarFrame},
     color,
     config::{
         self as cfg,
-        AppConfig, AudioPreset, BarInterpolation, BlendMode, ColorMode, ColorSource,
-        CustomAudioPreset, DecayMode, FrequencyDirection, GradientSource, GradientStop,
-        MotionShape, PalettePriority, StaticDistributionMode, TrackInfoConfig, TrackTextAlign,
-        TrackTextColorMode, VerticalColorStyle, VisualizerDirection,
+        AppConfig, AudioPreset, BarInterpolation, BeatFocusMode, BlendMode, ChannelMixMode,
+        ColorChangePreset, ColorMode, ColorPreset, ColorSource, CustomAudioPreset, DecayMode,
+        FrequencyDirection, FrequencyScaling, GradientPreset, GradientSource, GradientStop,
+        MotionShape, PalettePriority, StaticDistributionMode, StaticMultiPreset,
+        TrackInfoConfig, TrackTextAlign, TrackTextColorMode, VerticalColorStyle,
+        VisualizerDirection, WeightingCurve, WindowFunction,
     },
     musicbee::{self, TrackInfo},
 };
@@ -28,101 +30,6 @@ use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem},
     TrayIcon, TrayIconBuilder,
 };
-
-const TARGET_FRAME_TIME: Duration = Duration::from_millis(16);
-
-// ═══════════════════════════════════════════════════════════════
-// Windows: z-order positioning (no SetParent, keeps transparency)
-// ═══════════════════════════════════════════════════════════════
-
-#[cfg(target_os = "windows")]
-mod desktop {
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    use std::ffi::c_void;
-    use windows_sys::Win32::Foundation::HWND;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        BringWindowToTop, FindWindowW, GetWindow, GetWindowLongPtrW, SetForegroundWindow,
-        SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, GW_HWNDPREV, SWP_NOACTIVATE, SWP_NOMOVE,
-        SWP_NOSIZE, SWP_SHOWWINDOW,
-    };
-
-    const WS_EX_NOACTIVATE: isize = 0x0800_0000;
-    const WS_EX_TOOLWINDOW: isize = 0x0000_0080;
-
-    fn to_wide(s: &str) -> Vec<u16> {
-        s.encode_utf16().chain(std::iter::once(0)).collect()
-    }
-
-    fn hwnd_top() -> HWND {
-        std::ptr::null_mut()
-    }
-
-    pub fn get_hwnd(frame: &eframe::Frame) -> Option<HWND> {
-        let handle = frame.window_handle().ok()?;
-        match handle.as_raw() {
-            RawWindowHandle::Win32(w) => Some(w.hwnd.get() as *mut c_void),
-            _ => None,
-        }
-    }
-
-    /// Position the window just above Progman in the top-level z-order.
-    ///
-    ///   [App1] [App2] ... [hwnd (us)] [Progman + icons]
-    ///
-    /// Above the desktop icons; below every other app. Idempotent.
-    pub fn position_above_desktop(hwnd: HWND) {
-        unsafe {
-            let progman = FindWindowW(to_wide("Progman").as_ptr(), std::ptr::null());
-            if progman.is_null() {
-                return;
-            }
-            let above_progman = GetWindow(progman, GW_HWNDPREV);
-            let insert_after = if above_progman.is_null() {
-                hwnd_top()
-            } else {
-                above_progman
-            };
-            SetWindowPos(
-                hwnd,
-                insert_after,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            );
-        }
-    }
-
-    /// Background overlay mode: no focus, no taskbar, no alt-tab.
-    pub fn make_background_window(hwnd: HWND) {
-        unsafe {
-            let current = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-            let new_style = current | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
-            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style);
-        }
-    }
-
-    /// Interactive mode: appears in alt-tab, can receive focus, brought to top.
-    pub fn make_interactive_window(hwnd: HWND) {
-        unsafe {
-            let current = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-            let new_style = current & !WS_EX_NOACTIVATE & !WS_EX_TOOLWINDOW;
-            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style);
-            SetWindowPos(
-                hwnd,
-                hwnd_top(),
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
-            );
-            BringWindowToTop(hwnd);
-            SetForegroundWindow(hwnd);
-        }
-    }
-}
 
 // ═══════════════════════════════════════════════════════════════
 // Icon loader
@@ -704,6 +611,7 @@ struct VisualizerApp {
     audio_settings: Arc<ArcSwap<visualizer_core::config::AudioSettings>>,
     should_quit: Arc<AtomicBool>,
     current_fps: f32,
+    is_passthrough_set: bool,
     last_frame_time: Instant,
     track_rx: crossbeam_channel::Receiver<TrackInfo>,
     track_info: Option<TrackInfo>,
@@ -717,12 +625,14 @@ struct VisualizerApp {
     animated_cache: PaletteCache,
     last_palette_hash: u64,
     loaded_font_path: Option<String>,
+    smtc_session_count: Arc<AtomicUsize>,
 
     shared: Arc<Mutex<SettingsState>>,
-    settings_open: bool,
-    needs_mode_change: bool,
-    initialized: bool,
-    passthrough_active: bool,
+    settings_open: Arc<AtomicBool>,
+    config_gen: Arc<AtomicU64>,
+    seen_gen: u64,
+    was_settings_open: bool,
+    settings_icon: egui::IconData,
     ui_cmd_rx: crossbeam_channel::Receiver<UiCmd>,
 
     _tray_icon: TrayIcon,
@@ -742,12 +652,12 @@ impl VisualizerApp {
         let audio_settings = engine.settings.clone();
 
         let (track_tx, track_rx) = crossbeam_channel::unbounded();
-        let smtc_session_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let smtc_session_count = Arc::new(AtomicUsize::new(0));
         let smtc_ctx = ctx.clone();
         musicbee::spawn_smtc_listener(
             track_tx,
             should_quit.clone(),
-            smtc_session_count,
+            smtc_session_count.clone(),
             move || smtc_ctx.request_repaint(),
         );
 
@@ -806,7 +716,7 @@ impl VisualizerApp {
         }
 
         let num_bars = config.audio.num_bars;
-        let settings_open = config.open_settings_on_launch;
+        let settings_open = Arc::new(AtomicBool::new(config.open_settings_on_launch));
 
         let shared = Arc::new(Mutex::new(SettingsState {
             config: config.clone(),
@@ -827,8 +737,6 @@ impl VisualizerApp {
             system_fonts: list_system_fonts(),
         }));
 
-        let _ = egui_icon;
-
         Self {
             current_bars: vec![0.0; num_bars],
             current_peaks: vec![0.0; num_bars],
@@ -838,6 +746,7 @@ impl VisualizerApp {
             config,
             should_quit,
             current_fps: 0.0,
+            is_passthrough_set: false,
             last_frame_time: Instant::now(),
             track_rx,
             track_info: None,
@@ -851,11 +760,13 @@ impl VisualizerApp {
             animated_cache: PaletteCache::default(),
             last_palette_hash: 0,
             loaded_font_path: Some("__init__".to_string()),
+            smtc_session_count,
             shared,
             settings_open,
-            needs_mode_change: false,
-            initialized: false,
-            passthrough_active: false,
+            config_gen: Arc::new(AtomicU64::new(0)),
+            seen_gen: 0,
+            was_settings_open: false,
+            settings_icon: egui_icon,
             ui_cmd_rx,
             _tray_icon: tray_icon,
             _hotkey_manager: hotkey_manager,
@@ -872,112 +783,139 @@ impl VisualizerApp {
         }
     }
 
-    fn apply_window_mode(&mut self, _ctx: &egui::Context, frame: &eframe::Frame) {
-        #[cfg(target_os = "windows")]
-        {
-            let Some(hwnd) = desktop::get_hwnd(frame) else { return };
-            if self.settings_open {
-                desktop::make_interactive_window(hwnd);
-            } else {
-                desktop::make_background_window(hwnd);
-                desktop::position_above_desktop(hwnd);
+    // ── Overlay geometry ──────────────────────────────────────
+
+    fn compute_overlay_rect(&self, ctx: &egui::Context, monitor: egui::Rect) -> egui::Rect {
+        let n_bars = self.visual_num_bars().max(1);
+        let stride = self.config.bar_width + self.config.bar_gap;
+        let bars_extent = (n_bars as f32 * stride - self.config.bar_gap).max(1.0);
+
+        let rect_len = match self.config.visualizer_direction {
+            VisualizerDirection::Up | VisualizerDirection::Down => {
+                monitor.height() * self.config.height_scale
+            }
+            VisualizerDirection::Left | VisualizerDirection::Right => {
+                monitor.width() * self.config.height_scale
+            }
+        };
+        let max_bar_h = if self.config.max_bar_height > 0.0 {
+            self.config.max_bar_height.min(rect_len)
+        } else {
+            rect_len
+        };
+
+        let cx = monitor.center().x + self.config.x_offset;
+        let cy = monitor.center().y + self.config.y_offset;
+
+        let bars_rect = match self.config.visualizer_direction {
+            VisualizerDirection::Up => egui::Rect::from_min_max(
+                egui::pos2(
+                    cx - bars_extent / 2.0,
+                    monitor.bottom() + self.config.y_offset - max_bar_h,
+                ),
+                egui::pos2(cx + bars_extent / 2.0, monitor.bottom() + self.config.y_offset),
+            ),
+            VisualizerDirection::Down => egui::Rect::from_min_max(
+                egui::pos2(cx - bars_extent / 2.0, monitor.top() + self.config.y_offset),
+                egui::pos2(cx + bars_extent / 2.0, monitor.top() + self.config.y_offset + max_bar_h),
+            ),
+            VisualizerDirection::Right => egui::Rect::from_min_max(
+                egui::pos2(monitor.left() + self.config.x_offset, cy - bars_extent / 2.0),
+                egui::pos2(
+                    monitor.left() + self.config.x_offset + max_bar_h,
+                    cy + bars_extent / 2.0,
+                ),
+            ),
+            VisualizerDirection::Left => egui::Rect::from_min_max(
+                egui::pos2(
+                    monitor.right() + self.config.x_offset - max_bar_h,
+                    cy - bars_extent / 2.0,
+                ),
+                egui::pos2(monitor.right() + self.config.x_offset, cy + bars_extent / 2.0),
+            ),
+        };
+
+        let mut bbox = bars_rect;
+
+        let cfg = &self.config.track_info;
+        let show_art = cfg.show_cover_art && self.cover_texture.is_some();
+        let has_track = self.track_info.is_some();
+        let show_text = has_track && (cfg.show_title || cfg.show_artist);
+
+        if has_track && (show_art || show_text) {
+            let margin = 40.0;
+            let art_size = if show_art { cfg.cover_size } else { 0.0 };
+            let art_x = monitor.right() - margin - art_size + cfg.cover_x_offset;
+            let art_y = monitor.top() + margin + cfg.cover_y_offset;
+
+            if show_art {
+                let art_rect = egui::Rect::from_min_size(
+                    egui::pos2(art_x, art_y),
+                    egui::vec2(art_size, art_size),
+                );
+                bbox = bbox.union(art_rect);
+            }
+
+            if show_text {
+                let text_x = monitor.right() - margin + cfg.text_x_offset;
+                let mut text_y = monitor.top() + margin + cfg.text_y_offset;
+                if show_art {
+                    text_y += art_size + 14.0;
+                }
+                
+                let info = self.track_info.as_ref().unwrap();
+                let family = if cfg.font_path.is_some() { custom_font_family() } else { egui::FontFamily::Proportional };
+                let artist_font = egui::FontId::new(cfg.artist_font_size, family.clone());
+                let title_font = egui::FontId::new(cfg.title_font_size, family);
+
+                // Accurately measure the text width so the bounding box is tight!
+                let artist_w = if cfg.show_artist && !info.artist.is_empty() {
+                    ctx.fonts(|f| f.layout_no_wrap(info.artist.clone(), artist_font.clone(), egui::Color32::WHITE).size().x)
+                } else { 0.0 };
+                let title_w = if cfg.show_title && !info.title.is_empty() {
+                    ctx.fonts(|f| f.layout_no_wrap(info.title.clone(), title_font, egui::Color32::WHITE).size().x)
+                } else { 0.0 };
+
+                let max_w = artist_w.max(title_w).max(50.0);
+                let est_h = (cfg.title_font_size + cfg.artist_font_size) * cfg.line_height.max(1.0) + 20.0;
+
+                let text_rect = match cfg.alignment {
+                    TrackTextAlign::Right => egui::Rect::from_min_max(
+                        egui::pos2(text_x - max_w, text_y),
+                        egui::pos2(text_x, text_y + est_h),
+                    ),
+                    TrackTextAlign::Left => egui::Rect::from_min_max(
+                        egui::pos2(text_x, text_y),
+                        egui::pos2(text_x + max_w, text_y + est_h),
+                    ),
+                    TrackTextAlign::Center => egui::Rect::from_min_max(
+                        egui::pos2(text_x - max_w / 2.0, text_y),
+                        egui::pos2(text_x + max_w / 2.0, text_y + est_h),
+                    ),
+                };
+                bbox = bbox.union(text_rect);
             }
         }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let _ = frame;
+
+        if self.config.show_fps {
+            let fps_rect = egui::Rect::from_min_size(
+                monitor.left_top() + egui::vec2(20.0, 20.0),
+                egui::vec2(160.0, 30.0),
+            );
+            bbox = bbox.union(fps_rect);
         }
+
+        let pad = 32.0;
+        let bbox = bbox.expand(pad);
+
+        let min = egui::vec2(80.0, 60.0);
+        let size = bbox.size().max(min);
+        let center = bbox.center();
+        // Do NOT intersect with monitor here, otherwise things get clipped when Mirrored is wide.
+        egui::Rect::from_center_size(center, size)
     }
 
-    fn draw_settings_overlay(&mut self, ctx: &egui::Context) {
-        if !self.settings_open {
-            return;
-        }
-
-        let mut st = lock_state(&self.shared);
-
-        let screen_rect = ctx.screen_rect();
-        let backdrop_painter = ctx.layer_painter(egui::LayerId::new(
-            egui::Order::Middle,
-            egui::Id::new("settings_backdrop"),
-        ));
-        backdrop_painter.rect_filled(screen_rect, 0.0, egui::Color32::from_black_alpha(150));
-
-        let mut window_open = true;
-        egui::Window::new("Rust Visualizer — Settings")
-            .open(&mut window_open)
-            .collapsible(false)
-            .resizable(true)
-            .default_size(egui::vec2(560.0, 720.0))
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-            .show(ctx, |ui| {
-                st.draw_settings_ui(ui);
-            });
-
-        if let Some(idx) = st.pending_audio_preset_delete {
-            egui::Window::new("Confirm Delete")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                .show(ctx, |ui| {
-                    let name = st
-                        .config
-                        .custom_audio_presets
-                        .get(idx)
-                        .map(|p| p.name.clone())
-                        .unwrap_or_default();
-                    ui.label(format!("Delete preset '{}'?", name));
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Yes").clicked() {
-                            if idx < st.config.custom_audio_presets.len() {
-                                st.config.custom_audio_presets.remove(idx);
-                            }
-                            st.pending_audio_preset_delete = None;
-                        }
-                        if ui.button("No").clicked() {
-                            st.pending_audio_preset_delete = None;
-                        }
-                    });
-                });
-        }
-
-        let close = st.close_requested || !window_open;
-        st.close_requested = false;
-
-        if close {
-            st.config.save();
-            drop(st);
-            self.settings_open = false;
-            self.needs_mode_change = true;
-            return;
-        }
-
-        let fp = config_fingerprint(&st.config);
-        let changed = st.audio_dirty || fp != st.last_fingerprint;
-        st.last_fingerprint = fp;
-
-        if changed {
-            let new_config = st.config.clone();
-            let audio_dirty = st.audio_dirty;
-            st.audio_dirty = false;
-            drop(st);
-
-            self.config = new_config;
-            if audio_dirty || self.config.audio != *self.audio_settings.load_full() {
-                self.audio_settings
-                    .store(Arc::new(self.config.audio.clone()));
-            }
-
-            let hash = self.palette_fingerprint();
-            if hash != self.last_palette_hash {
-                self.last_palette_hash = hash;
-                self.update_palettes();
-            }
-
-            self.config.save();
-        }
-    }
+    // ── Palette updates ───────────────────────────────────────
 
     fn update_palettes(&mut self) {
         match self.config.color_mode {
@@ -1123,6 +1061,8 @@ impl VisualizerApp {
         h.finish()
     }
 
+    // ── Track updates ─────────────────────────────────────────
+
     fn poll_track_updates(&mut self, ctx: &egui::Context) {
         while let Ok(info) = self.track_rx.try_recv() {
             if let Some(bytes) = &info.cover_art {
@@ -1175,6 +1115,8 @@ impl VisualizerApp {
         ctx.set_fonts(fonts);
         self.loaded_font_path = target;
     }
+
+    // ── Color helpers ─────────────────────────────────────────
 
     fn get_visualizer_text_color(&self, time: f32) -> [u8; 3] {
         match self.config.color_mode {
@@ -1542,6 +1484,8 @@ impl VisualizerApp {
         }
     }
 
+    // ── Track info drawing ────────────────────────────────────
+
     fn draw_styled_text(
         &self,
         ctx: &egui::Context,
@@ -1671,6 +1615,8 @@ impl VisualizerApp {
             );
         }
     }
+
+    // ── Bars ─────────────────────────────────────────────────
 
     fn draw_bars(
         &mut self,
@@ -4172,6 +4118,87 @@ fn fft_size_combo(ui: &mut egui::Ui, a: &mut visualizer_core::config::AudioSetti
 }
 
 // ═══════════════════════════════════════════════════════════════
+// Settings viewport
+// ═══════════════════════════════════════════════════════════════
+
+fn run_settings_viewport(
+    ctx: &egui::Context,
+    shared: &Mutex<SettingsState>,
+    open: &AtomicBool,
+    generation: &AtomicU64,
+) {
+    let mut st = lock_state(shared);
+
+    if ctx.input(|i| i.viewport().close_requested()) {
+        st.config.save();
+        drop(st);
+        open.store(false, Ordering::Relaxed);
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
+        return;
+    }
+
+    if (st.config.settings_scale - st.old_settings_scale).abs() > 0.01 {
+        st.old_settings_scale = st.config.settings_scale;
+        let scale = st.config.settings_scale.clamp(0.75, 1.5);
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+            560.0 * scale,
+            720.0 * scale,
+        )));
+    }
+
+    egui::CentralPanel::default()
+        .frame(egui::Frame::none().fill(egui::Color32::BLACK))
+        .show(ctx, |ui| {
+            st.draw_settings_ui(ui);
+        });
+
+    if let Some(idx) = st.pending_audio_preset_delete {
+        egui::Window::new("Confirm Delete")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                let name = st
+                    .config
+                    .custom_audio_presets
+                    .get(idx)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default();
+                ui.label(format!("Delete preset '{}'?", name));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Yes").clicked() {
+                        if idx < st.config.custom_audio_presets.len() {
+                            st.config.custom_audio_presets.remove(idx);
+                        }
+                        st.pending_audio_preset_delete = None;
+                    }
+                    if ui.button("No").clicked() {
+                        st.pending_audio_preset_delete = None;
+                    }
+                });
+            });
+    }
+
+    let fp = config_fingerprint(&st.config);
+    let changed = st.audio_dirty || fp != st.last_fingerprint;
+    st.last_fingerprint = fp;
+
+    let wants_close = st.close_requested;
+    st.close_requested = false;
+    drop(st);
+
+    if changed {
+        generation.fetch_add(1, Ordering::Release);
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
+    }
+    if wants_close {
+        open.store(false, Ordering::Relaxed);
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
 // eframe::App
 // ═══════════════════════════════════════════════════════════════
 
@@ -4180,7 +4207,7 @@ impl eframe::App for VisualizerApp {
         egui::Rgba::TRANSPARENT.to_array()
     }
 
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame_time).as_secs_f32();
         self.last_frame_time = now;
@@ -4198,60 +4225,28 @@ impl eframe::App for VisualizerApp {
 
         while let Ok(cmd) = self.ui_cmd_rx.try_recv() {
             match cmd {
-                UiCmd::OpenSettings => {
-                    if !self.settings_open {
-                        self.settings_open = true;
-                        self.needs_mode_change = true;
-                    }
-                }
+                UiCmd::OpenSettings => self.settings_open.store(true, Ordering::Relaxed),
                 UiCmd::ToggleSettings => {
-                    self.settings_open = !self.settings_open;
-                    self.needs_mode_change = true;
+                    let v = self.settings_open.load(Ordering::Relaxed);
+                    self.settings_open.store(!v, Ordering::Relaxed);
                 }
-                UiCmd::Quit => {
-                    self.should_quit.store(true, Ordering::Relaxed);
-                }
+                UiCmd::Quit => self.should_quit.store(true, Ordering::Relaxed),
             }
         }
-
         if self.should_quit.load(Ordering::Relaxed) {
-            self.config.save();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
 
-        if !self.initialized {
-            self.initialized = true;
-            let monitor_size = ctx
-                .input(|i| i.viewport().monitor_size)
-                .unwrap_or(egui::vec2(1920.0, 1080.0));
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(monitor_size));
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(0.0, 0.0)));
-            self.apply_window_mode(ctx, frame);
-        }
-
-        if self.needs_mode_change {
-            self.needs_mode_change = false;
-            self.apply_window_mode(ctx, frame);
-        }
-
-        // Keep the window positioned just above the desktop but below other apps.
-        // New apps that open will appear above us; this call re-asserts our
-        // preferred z-order so we stay visible on the desktop. Skip while
-        // settings is open (interactive mode).
-        #[cfg(target_os = "windows")]
-        if !self.settings_open {
-            if let Some(hwnd) = desktop::get_hwnd(frame) {
-                desktop::position_above_desktop(hwnd);
+        let generation = self.config_gen.load(Ordering::Acquire);
+        if generation != self.seen_gen {
+            self.seen_gen = generation;
+            let mut st = lock_state(&self.shared);
+            self.config = st.config.clone();
+            if st.audio_dirty || self.config.audio != *self.audio_settings.load_full() {
+                self.audio_settings.store(Arc::new(self.config.audio.clone()));
+                st.audio_dirty = false;
             }
-        }
-
-        // Pointer passthrough: let clicks pass through to desktop icons when
-        // the settings panel isn't open.
-        let want_passthrough = !self.settings_open;
-        if self.passthrough_active != want_passthrough {
-            ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(want_passthrough));
-            self.passthrough_active = want_passthrough;
         }
 
         self.poll_track_updates(ctx);
@@ -4260,6 +4255,12 @@ impl eframe::App for VisualizerApp {
         if new_hash != self.last_palette_hash {
             self.update_palettes();
             self.last_palette_hash = new_hash;
+            let mut st = lock_state(&self.shared);
+            st.active_palettes = self.active_palettes.clone();
+            drop(st);
+            if self.settings_open.load(Ordering::Relaxed) {
+                ctx.request_repaint_of(egui::ViewportId::from_hash_of("settings"));
+            }
         }
 
         if self.config.track_info.font_path != self.loaded_font_path {
@@ -4273,22 +4274,38 @@ impl eframe::App for VisualizerApp {
         }
 
         let mut latest: Option<BarFrame> = None;
-        while let Ok(frame_data) = self.audio_rx.try_recv() {
-            latest = Some(frame_data);
+        while let Ok(frame) = self.audio_rx.try_recv() {
+            latest = Some(frame);
         }
-        if let Some(f) = latest {
-            let limit = self.current_bars.len().min(f.values.len());
-            self.current_bars[..limit].copy_from_slice(&f.values[..limit]);
-            self.current_peaks[..limit].copy_from_slice(&f.peaks[..limit]);
-            self.last_bpm = f.bpm;
+        if let Some(frame) = latest {
+            let limit = self.current_bars.len().min(frame.values.len());
+            self.current_bars[..limit].copy_from_slice(&frame.values[..limit]);
+            self.current_peaks[..limit].copy_from_slice(&frame.peaks[..limit]);
+            self.last_bpm = frame.bpm;
         }
 
-        let monitor_size = ctx
-            .input(|i| i.viewport().monitor_size)
-            .unwrap_or(egui::vec2(1920.0, 1080.0));
+        if !self.is_passthrough_set {
+            ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
+            self.is_passthrough_set = true;
+        }
+
+        // Get the accurate monitor size directly from the viewport info
+        let monitor_size = ctx.input(|i| i.viewport().monitor_size).unwrap_or(egui::vec2(1920.0, 1080.0));
         let monitor = egui::Rect::from_min_size(egui::Pos2::ZERO, monitor_size);
-        let overlay_origin = egui::Pos2::ZERO;
 
+        let target = self.compute_overlay_rect(ctx, monitor);
+
+        let actual_pos = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min)).unwrap_or(egui::Pos2::ZERO);
+        let actual_size = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size())).unwrap_or(egui::Vec2::ZERO);
+
+        // Send commands if the actual window differs from the target.
+        if (actual_size - target.size()).length() > 1.0 || (actual_pos - target.min).length() > 1.0 {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target.size()));
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target.min));
+        }
+
+        let local_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, target.size());
+        let overlay_origin = target.min;
         let painter = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Background,
             egui::Id::new("overlay"),
@@ -4298,7 +4315,7 @@ impl eframe::App for VisualizerApp {
             let c = self.config.bg_color;
             let bg_color =
                 egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], self.config.bg_opacity);
-            painter.rect_filled(monitor, 0.0, bg_color);
+            painter.rect_filled(local_rect, 0.0, bg_color);
         }
 
         self.draw_bars(&painter, ctx, monitor, overlay_origin);
@@ -4306,8 +4323,9 @@ impl eframe::App for VisualizerApp {
 
         if self.config.show_fps {
             let world_pos = monitor.left_top() + egui::vec2(20.0, 20.0);
+            let local_pos = world_pos - overlay_origin.to_vec2();
             painter.text(
-                world_pos,
+                local_pos,
                 egui::Align2::LEFT_TOP,
                 format!("FPS: {:.1}", self.current_fps),
                 egui::FontId::monospace(16.0),
@@ -4315,22 +4333,46 @@ impl eframe::App for VisualizerApp {
             );
         }
 
-        if self.settings_open {
-            self.draw_settings_overlay(ctx);
+        let open = self.settings_open.load(Ordering::Relaxed);
+        let settings_id = egui::ViewportId::from_hash_of("settings");
+        if open {
+            let scale = self.config.settings_scale.clamp(0.75, 1.5);
+            let mut builder = egui::ViewportBuilder::default()
+                .with_title("Rust Visualizer — Settings")
+                .with_inner_size([560.0 * scale, 720.0 * scale])
+                .with_decorations(true)
+                .with_resizable(true)
+                .with_always_on_top();
+            if self.settings_icon.width > 0 {
+                builder = builder.with_icon(self.settings_icon.clone());
+            }
+
+            if let Ok(mut st) = self.shared.try_lock() {
+                st.last_bpm = self.last_bpm;
+                st.current_fps = self.current_fps;
+            }
+
+            let shared = self.shared.clone();
+            let open_flag = self.settings_open.clone();
+            let generation = self.config_gen.clone();
+            ctx.show_viewport_deferred(settings_id, builder, move |ctx, _class| {
+                run_settings_viewport(ctx, &shared, &open_flag, &generation);
+            });
+        } else if self.was_settings_open {
+            ctx.send_viewport_cmd_to(settings_id, egui::ViewportCommand::Close);
         }
+        self.was_settings_open = open;
 
         let moving = self.current_bars.iter().any(|&v| v > 0.0005)
             || self.current_peaks.iter().any(|&v| v > 0.0005)
-            || self.config.color_mode == ColorMode::Animated
-            || self.settings_open;
+            || self.config.color_mode == ColorMode::Animated;
         if moving {
-            ctx.request_repaint_after(TARGET_FRAME_TIME);
+            ctx.request_repaint();
         }
     }
 
     fn on_exit(&mut self, _gl: Option<&glow::Context>) {
         self.config.save();
-        self.should_quit.store(true, Ordering::Relaxed);
     }
 }
 
@@ -4345,9 +4387,9 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_transparent(true)
             .with_decorations(false)
-            .with_inner_size([1920.0, 1080.0])
+            .with_always_on_top()
+            .with_inner_size([1280.0, 720.0])
             .with_position([0.0, 0.0])
-            .with_active(false)
             .with_icon(egui_icon),
         vsync: true,
         ..Default::default()
