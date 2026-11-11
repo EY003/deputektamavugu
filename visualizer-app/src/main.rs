@@ -1726,8 +1726,8 @@ impl VisualizerApp {
 
         let bar_width = self.config.bar_width;
         let gap = self.config.bar_gap;
-        let stride = bar_width + gap;
-        let total_size = visual_num_bars as f32 * stride - gap;
+        let stride = (bar_width + gap).max(0.1);
+        let total_size = (visual_num_bars as f32 * stride - gap).max(1.0);
         let max_h = self.config.max_bar_height;
         let freq_dir = self.config.frequency_direction;
         let dir = self.config.visualizer_direction;
@@ -2623,7 +2623,7 @@ impl SettingsState {
                 let selected = self.color_subtab == sub;
                 let mut text = egui::RichText::new(label).size(13.0);
                 if selected {
-                    text = text.strong().color(accent());
+                    text = text.strong().color(egui::Color32::WHITE);
                 }
                 if ui
                     .add(egui::SelectableLabel::new(selected, text))
@@ -2988,8 +2988,12 @@ impl SettingsState {
             Self::draw_palette_preview(ui, &preview);
         } else {
             let (rect, response) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width() - 16.0, 30.0),
+                egui::vec2(ui.available_width(), 36.0),
                 egui::Sense::click_and_drag(),
+            );
+            let bar_rect = egui::Rect::from_min_max(
+                egui::pos2(rect.left() + 10.0, rect.top() + 3.0),
+                egui::pos2(rect.right() - 10.0, rect.bottom() - 3.0),
             );
             let painter = ui.painter();
             let preview_stops = self
@@ -3003,18 +3007,18 @@ impl SettingsState {
                 let t1 = i as f32 / steps as f32;
                 let t2 = (i + 1) as f32 / steps as f32;
                 let c1 = color::sample_gradient(&preview_stops, t1);
-                let x1 = rect.left() + rect.width() * t1;
-                let x2 = rect.left() + rect.width() * t2;
+                let x1 = bar_rect.left() + bar_rect.width() * t1;
+                let x2 = bar_rect.left() + bar_rect.width() * t2;
                 let r =
-                    egui::Rect::from_min_max(egui::pos2(x1, rect.top()), egui::pos2(x2, rect.bottom()));
+                    egui::Rect::from_min_max(egui::pos2(x1, bar_rect.top()), egui::pos2(x2, bar_rect.bottom()));
                 painter.rect_filled(r, 0.0, egui::Color32::from_rgb(c1[0], c1[1], c1[2]));
             }
             let mut sort_stops = false;
             if let Some(stops) = self.config.gradient_source.static_stops_mut() {
                 for (i, stop) in stops.iter_mut().enumerate() {
-                    let x = rect.left() + rect.width() * stop.position;
+                    let x = bar_rect.left() + bar_rect.width() * stop.position;
                     let stop_rect = egui::Rect::from_center_size(
-                        egui::pos2(x, rect.center().y),
+                        egui::pos2(x, bar_rect.center().y),
                         egui::vec2(12.0, 30.0),
                     );
                     let stop_response = ui.interact(
@@ -3024,7 +3028,7 @@ impl SettingsState {
                     );
                     if stop_response.dragged() {
                         stop.position =
-                            (stop.position + stop_response.drag_delta().x / rect.width())
+                            (stop.position + stop_response.drag_delta().x / bar_rect.width())
                                 .clamp(0.0, 1.0);
                         sort_stops = true;
                     }
@@ -3045,7 +3049,7 @@ impl SettingsState {
             }
             if response.double_clicked() {
                 if let Some(pos) = response.interact_pointer_pos() {
-                    let t = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                    let t = ((pos.x - bar_rect.left()) / bar_rect.width()).clamp(0.0, 1.0);
                     let c = color::sample_gradient(&preview_stops, t);
                     if let Some(stops) = self.config.gradient_source.static_stops_mut() {
                         stops.push(GradientStop { color: c, position: t });
@@ -4326,9 +4330,9 @@ impl VisualizerApp {
         let ov = origin.to_vec2();
         let scale = st.config.settings_scale.clamp(0.75, 1.5);
         let scale_key = (scale * 100.0).round() as i32;
-        let default_size = (egui::vec2(760.0, 560.0) * scale)
+        let default_size = (egui::vec2(620.0, 520.0) * scale)
             .min(monitor.size() - egui::vec2(40.0, 80.0))
-            .max(egui::vec2(520.0, 320.0));
+            .max(egui::vec2(450.0, 320.0));
 
         let frame = egui::Frame::window(&ctx.style())
             .fill(egui::Color32::BLACK)
@@ -4345,7 +4349,7 @@ impl VisualizerApp {
             .collapsible(false)
             .resizable(true)
             .default_size(default_size)
-            .min_size(egui::vec2(520.0, 320.0))
+            .min_size(egui::vec2(450.0, 320.0))
             .default_pos(monitor.center() - default_size / 2.0 - ov);
 
         // egui stores the panel position in window-local coordinates. When the
@@ -4568,8 +4572,14 @@ impl eframe::App for VisualizerApp {
         let actual_pos = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min)).unwrap_or(egui::Pos2::ZERO);
         let actual_size = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size())).unwrap_or(egui::Vec2::ZERO);
 
+        let pointer_down = ctx.input(|i| i.pointer.any_down());
+
         // Send commands if the actual window differs from the target.
-        if (actual_size - target.size()).length() > 1.0 || (actual_pos - target.min).length() > 1.0 {
+        // DO NOT move/resize while the user is interacting (prevents slider jitter).
+        if !pointer_down
+            && ((actual_size - target.size()).length() > 1.0
+                || (actual_pos - target.min).length() > 1.0)
+        {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target.size()));
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target.min));
         }
