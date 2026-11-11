@@ -350,11 +350,6 @@ fn hash_gradient_source<H: std::hash::Hasher>(s: &GradientSource, h: &mut H) {
 
 fn accent() -> egui::Color32 { egui::Color32::from_rgb(0xB7, 0x41, 0x0E) }
 
-/// Central style/theme applied to the settings panel. Handles:
-///  - menu scale
-///  - white body text
-///  - accent-colored selection (replacing egui's default blue)
-///  - modern rounded widgets with accent handles
 fn apply_settings_style(ui: &mut egui::Ui, scale: f32) {
     let accent = accent();
 
@@ -389,14 +384,10 @@ fn apply_settings_style(ui: &mut egui::Ui, scale: f32) {
 
     let v = ui.visuals_mut();
 
-    // Settings text is mostly white; help/description text keeps its own grey.
     v.override_text_color = Some(egui::Color32::from_rgb(238, 238, 238));
-
-    // Replace egui's default blue selection with the visualizer accent.
     v.selection.bg_fill = accent;
     v.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
 
-    // Modern dark widgets with rounded corners and accent handles.
     v.widgets.inactive.bg_fill = egui::Color32::from_rgb(30, 30, 30);
     v.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(30, 30, 30);
     v.widgets.inactive.bg_stroke =
@@ -711,15 +702,14 @@ struct VisualizerApp {
     seen_gen: u64,
     ui_cmd_rx: crossbeam_channel::Receiver<UiCmd>,
 
-    // Single-window overlay state
     overlay: Option<overlay::Overlay>,
     overlay_last_try: Instant,
-    settings_rect: Option<egui::Rect>,          // panel rect, window-local points
-    settings_world_min: Option<egui::Pos2>,     // panel top-left, monitor coordinates
+    settings_rect: Option<egui::Rect>,
+    settings_world_min: Option<egui::Pos2>,
     settings_last_origin: egui::Pos2,
     settings_last_scale_key: i32,
     settings_gate_since: Option<Instant>,
-    hot_rect: Arc<Mutex<Option<[f32; 4]>>>,     // panel rect in client px (for the cursor watcher)
+    hot_rect: Arc<Mutex<Option<[f32; 4]>>>,
     cursor_inside: Arc<AtomicBool>,
 
     _tray_icon: TrayIcon,
@@ -877,11 +867,9 @@ impl VisualizerApp {
         }
     }
 
-    // ── Overlay geometry ──────────────────────────────────────
-
     fn compute_overlay_rect(&self, ctx: &egui::Context, monitor: egui::Rect) -> egui::Rect {
         let n_bars = self.visual_num_bars().max(1);
-        let stride = self.config.bar_width + self.config.bar_gap;
+        let stride = (self.config.bar_width + self.config.bar_gap).max(0.1);
         let bars_extent = (n_bars as f32 * stride - self.config.bar_gap).max(1.0);
 
         let rect_len = match self.config.visualizer_direction {
@@ -1006,8 +994,6 @@ impl VisualizerApp {
         let center = bbox.center();
         egui::Rect::from_center_size(center, size)
     }
-
-    // ── Palette updates ───────────────────────────────────────
 
     fn update_palettes(&mut self) {
         match self.config.color_mode {
@@ -1153,8 +1139,6 @@ impl VisualizerApp {
         h.finish()
     }
 
-    // ── Track updates ─────────────────────────────────────────
-
     fn poll_track_updates(&mut self, ctx: &egui::Context) {
         while let Ok(info) = self.track_rx.try_recv() {
             if let Some(bytes) = &info.cover_art {
@@ -1207,8 +1191,6 @@ impl VisualizerApp {
         ctx.set_fonts(fonts);
         self.loaded_font_path = target;
     }
-
-    // ── Color helpers ─────────────────────────────────────────
 
     fn get_visualizer_text_color(&self, time: f32) -> [u8; 3] {
         match self.config.color_mode {
@@ -1576,8 +1558,6 @@ impl VisualizerApp {
         }
     }
 
-    // ── Track info drawing ────────────────────────────────────
-
     fn draw_styled_text(
         &self,
         ctx: &egui::Context,
@@ -1707,8 +1687,6 @@ impl VisualizerApp {
             );
         }
     }
-
-    // ── Bars ─────────────────────────────────────────────────
 
     fn draw_bars(
         &mut self,
@@ -1885,14 +1863,12 @@ impl VisualizerApp {
             painter.add(egui::Shape::mesh(self.mesh.take_mesh()));
         }
 
-        // ── Outlines ─────────────────────────────────────────
         if outline_on {
             let oc = self.config.visualizer_outline_color;
             let stroke_color = self.apply_vis(egui::Color32::from_rgb(oc[0], oc[1], oc[2]));
             let stroke = egui::Stroke::new(self.config.visualizer_outline_thickness, stroke_color);
 
             if is_smooth {
-                // Smooth bars: draw only the outer contour, excluding the base.
                 if visual_num_bars > 0 {
                     let first_edge = start_pos;
                     let last_i = visual_num_bars - 1;
@@ -1908,11 +1884,9 @@ impl VisualizerApp {
                     let mut points: Vec<egui::Pos2> =
                         Vec::with_capacity(visual_num_bars + 4);
 
-                    // Left side of the contour (from base to top).
                     points.push(bar_vertex(dir, first_edge, anchor, first_len, 0.0));
                     points.push(bar_vertex(dir, first_edge, anchor, first_len, 1.0));
 
-                    // Top contour through every bar's tip.
                     for i in 0..visual_num_bars {
                         let idx = frequency_index(i, base_num_bars, freq_dir);
                         let len = (self.current_bars[idx] * rect_len)
@@ -1921,14 +1895,12 @@ impl VisualizerApp {
                         points.push(bar_vertex(dir, perp, anchor, len, 1.0));
                     }
 
-                    // Right side of the contour (from top to base).
                     points.push(bar_vertex(dir, last_edge, anchor, last_len, 1.0));
                     points.push(bar_vertex(dir, last_edge, anchor, last_len, 0.0));
 
                     painter.add(egui::Shape::line(points, stroke));
                 }
             } else {
-                // Step bars: square outlines (radius = 0) match the square mesh.
                 for i in 0..visual_num_bars {
                     let idx = frequency_index(i, base_num_bars, freq_dir);
                     let len = (self.current_bars[idx] * rect_len)
@@ -4299,7 +4271,6 @@ fn fft_size_combo(ui: &mut egui::Ui, a: &mut visualizer_core::config::AudioSetti
 // ═══════════════════════════════════════════════════════════════
 
 impl VisualizerApp {
-    /// Locate our own HWND once the window exists and install the z-order hook.
     fn ensure_overlay(&mut self, ctx: &egui::Context) {
         if self.overlay.is_some() || self.overlay_last_try.elapsed() < Duration::from_millis(250) {
             return;
@@ -4320,8 +4291,6 @@ impl VisualizerApp {
         }
     }
 
-    /// Draw the settings panel as an egui window inside the overlay.
-    /// `origin` is the overlay window's top-left in monitor coordinates.
     fn draw_settings_window(&mut self, ctx: &egui::Context, monitor: egui::Rect, origin: egui::Pos2) {
         let shared = self.shared.clone();
         let mut st = lock_state(&shared);
@@ -4342,7 +4311,6 @@ impl VisualizerApp {
             .inner_margin(egui::Margin::symmetric(12.0, 10.0));
 
         let mut win = egui::Window::new("Rust Visualizer — Settings")
-            // New id per scale => egui forgets the old size and applies `default_size`.
             .id(egui::Id::new(("settings_window", scale_key)))
             .title_bar(false)
             .frame(frame)
@@ -4352,9 +4320,6 @@ impl VisualizerApp {
             .min_size(egui::vec2(450.0, 320.0))
             .default_pos(monitor.center() - default_size / 2.0 - ov);
 
-        // egui stores the panel position in window-local coordinates. When the
-        // overlay window moves/resizes (or the scale changes) re-place the panel
-        // so it stays put on screen.
         if origin != self.settings_last_origin || scale_key != self.settings_last_scale_key {
             if let Some(w) = self.settings_world_min {
                 win = win.current_pos(w - ov);
@@ -4413,8 +4378,6 @@ impl VisualizerApp {
         let changed = st.audio_dirty || fp != st.last_fingerprint;
         st.last_fingerprint = fp;
 
-        // `close_requested` is set by the in-UI close button; there is no
-        // title-bar X because the window uses `title_bar(false)`.
         let wants_close = st.close_requested;
         st.close_requested = false;
         if wants_close {
@@ -4433,7 +4396,6 @@ impl VisualizerApp {
         }
     }
 
-    /// The overlay is click-through, except over the settings panel.
     fn update_input_passthrough(&mut self, ctx: &egui::Context, settings_open: bool) {
         let ppp = ctx.pixels_per_point();
         let mut inside = false;
@@ -4441,7 +4403,6 @@ impl VisualizerApp {
 
         if settings_open {
             if let Some(r) = self.settings_rect {
-                // A little slack so the resize handles on the border work.
                 let r = r.expand(8.0);
                 let h = [r.min.x * ppp, r.min.y * ppp, r.max.x * ppp, r.max.y * ppp];
                 hot = Some(h);
@@ -4455,13 +4416,10 @@ impl VisualizerApp {
 
         let interactive = settings_open
             && if self.overlay.is_none() {
-                // HWND not found (should not happen): keep the panel usable.
                 true
             } else {
                 inside
-                    // dropdowns / colour pickers can extend past the panel
                     || ctx.memory(|m| m.any_popup_open())
-                    // keep the mouse while dragging or resizing
                     || (!self.is_passthrough_set && ctx.input(|i| i.pointer.any_down()))
             };
 
@@ -4558,28 +4516,27 @@ impl eframe::App for VisualizerApp {
 
         self.ensure_overlay(ctx);
 
-        // Get the accurate monitor size directly from the viewport info
         let monitor_size = ctx.input(|i| i.viewport().monitor_size).unwrap_or(egui::vec2(1920.0, 1080.0));
         let monitor = egui::Rect::from_min_size(egui::Pos2::ZERO, monitor_size);
 
         let settings_open = self.settings_open.load(Ordering::Relaxed);
 
-        // Rect the visualizer itself needs. While the settings panel is open the
-        // window grows to also cover the whole monitor so the panel fits in it.
         let vis_rect = self.compute_overlay_rect(ctx, monitor);
-        let target = if settings_open { vis_rect.union(monitor) } else { vis_rect };
+        
+        // This is the crucial fix: lock the window to the monitor while settings are open.
+        // This prevents the window from moving when the user drags a slider that changes
+        // the visualizer's size or position, eliminating all slider glitching.
+        let target = if settings_open {
+            monitor
+        } else {
+            vis_rect
+        };
 
         let actual_pos = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min)).unwrap_or(egui::Pos2::ZERO);
         let actual_size = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size())).unwrap_or(egui::Vec2::ZERO);
 
-        let pointer_down = ctx.input(|i| i.pointer.any_down());
-
         // Send commands if the actual window differs from the target.
-        // DO NOT move/resize while the user is interacting (prevents slider jitter).
-        if !pointer_down
-            && ((actual_size - target.size()).length() > 1.0
-                || (actual_pos - target.min).length() > 1.0)
-        {
+        if (actual_size - target.size()).length() > 1.0 || (actual_pos - target.min).length() > 1.0 {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target.size()));
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target.min));
         }
@@ -4594,7 +4551,6 @@ impl eframe::App for VisualizerApp {
             let c = self.config.bg_color;
             let bg_color =
                 egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], self.config.bg_opacity);
-            // Only the visualizer area gets the background, not the whole (bigger) window.
             painter.rect_filled(vis_rect.translate(-overlay_origin.to_vec2()), 0.0, bg_color);
         }
 
@@ -4613,10 +4569,7 @@ impl eframe::App for VisualizerApp {
             );
         }
 
-        // ── Settings panel, drawn inside this same overlay window ──
         if settings_open {
-            // Wait until the OS window has actually grown, otherwise egui would
-            // clamp the panel into the still-small window.
             let screen = ctx.screen_rect();
             let ready = screen.width() + 2.0 >= target.width()
                 && screen.height() + 2.0 >= target.height();
@@ -4634,7 +4587,6 @@ impl eframe::App for VisualizerApp {
 
         self.update_input_passthrough(ctx, settings_open);
 
-        // Keep the window just above the desktop icons (e.g. after "Show desktop").
         if let Some(ov) = self.overlay.as_mut() {
             ov.tick();
         }
@@ -4652,10 +4604,6 @@ impl eframe::App for VisualizerApp {
         self.config.save();
     }
 }
-
-// ═══════════════════════════════════════════════════════════════
-// main
-// ═══════════════════════════════════════════════════════════════
 
 fn main() -> eframe::Result<()> {
     let (egui_icon, _) = load_icon();
