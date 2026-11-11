@@ -17,9 +17,10 @@
 //!   z-order change of *our* window is redirected to "just above the icon host".
 //! * "Show desktop" can raise the icon host above us, so `Overlay::tick`
 //!   periodically checks and re-pins.
-//! * Optionally the window gets `WS_EX_TOOLWINDOW` (no taskbar button / Alt-Tab
-//!   entry).  Winit rewrites the extended style whenever the click-through flag
-//!   is toggled, so the flag is re-applied from `WM_STYLECHANGING`.
+//! * The window gets `WS_EX_TOOLWINDOW` (no taskbar button / Alt-Tab entry) and
+//!   has `WS_EX_APPWINDOW` cleared.  Winit rewrites the extended style whenever
+//!   the click-through flag is toggled, so the flags are re-applied from
+//!   `WM_STYLECHANGING`.
 
 use eframe::egui;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
@@ -35,7 +36,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetWindowThreadProcessId, IsWindow, IsWindowVisible, SetWindowLongPtrW, SetWindowPos,
     ShowWindow, GWL_EXSTYLE, GW_HWNDPREV, STYLESTRUCT, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     SWP_NOZORDER, SW_HIDE, SW_SHOWNA, WINDOWPOS, WM_STYLECHANGING, WM_WINDOWPOSCHANGING,
-    WS_EX_TOOLWINDOW,
+    WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
 
 /// Hide the overlay from the taskbar / Alt-Tab (also keeps it from being
@@ -154,10 +155,12 @@ unsafe extern "system" fn subclass_proc(
                 wp.hwndInsertAfter = host as HWND;
             }
         }
-        // Keep WS_EX_TOOLWINDOW even if winit rewrites the extended style.
+        // Keep WS_EX_TOOLWINDOW (and no WS_EX_APPWINDOW) even if winit rewrites
+        // the extended style.
         WM_STYLECHANGING if HIDE_FROM_TASKBAR && (wparam as i32) == GWL_EXSTYLE => {
             let ss = &mut *(lparam as *mut STYLESTRUCT);
             ss.styleNew |= WS_EX_TOOLWINDOW;
+            ss.styleNew &= !WS_EX_APPWINDOW;
         }
         _ => {}
     }
@@ -190,11 +193,8 @@ impl Overlay {
                     ShowWindow(hwnd as HWND, SW_HIDE);
                 }
                 let ex = GetWindowLongPtrW(hwnd as HWND, GWL_EXSTYLE) as isize;
-                SetWindowLongPtrW(
-                    hwnd as HWND,
-                    GWL_EXSTYLE,
-                    (ex | WS_EX_TOOLWINDOW as isize) as _,
-                );
+                let new_ex = (ex | WS_EX_TOOLWINDOW as isize) & !(WS_EX_APPWINDOW as isize);
+                SetWindowLongPtrW(hwnd as HWND, GWL_EXSTYLE, new_ex as _);
                 if was_visible {
                     ShowWindow(hwnd as HWND, SW_SHOWNA);
                 }
