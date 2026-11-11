@@ -36,7 +36,6 @@ use tray_icon::{
 #[cfg(target_os = "windows")]
 mod desktop_integration {
     use std::ffi::CString;
-    use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
         FindWindowA, FindWindowExA, GetWindowLongW, SetParent, SetWindowLongW, SetWindowPos,
         GWL_EXSTYLE, GWL_STYLE, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
@@ -51,20 +50,23 @@ mod desktop_integration {
         let title_cstr = CString::new(window_title).map_err(|e| e.to_string())?;
         let title_pcstr = PCSTR::from_raw(title_cstr.as_ptr() as *const u8);
 
-        let hwnd = FindWindowA(None, title_pcstr);
+        // windows 0.58: these functions return Result<HWND>, not HWND.
+        let hwnd = FindWindowA(None, title_pcstr)
+            .map_err(|e| format!("FindWindowA(target): {e}"))?;
         if hwnd.0 == 0 {
-            return Err("Window not found".into());
+            return Err("target window handle is null".into());
         }
 
-        let progman = FindWindowA(s!("Progman"), None);
+        let progman = FindWindowA(s!("Progman"), None)
+            .map_err(|e| format!("FindWindowA(Progman): {e}"))?;
         if progman.0 == 0 {
-            return Err("Progman not found".into());
+            return Err("Progman handle is null".into());
         }
 
-        // Ensure SHELLDLL_DefView exists (it hosts the icons)
-        let _shell_view = FindWindowExA(progman, None, s!("SHELLDLL_DefView"), None);
+        // Best-effort: make sure SHELLDLL_DefView exists.
+        let _ = FindWindowExA(progman, None, s!("SHELLDLL_DefView"), None);
 
-        // Convert to a child window
+        // Convert to a child window.
         let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
         let new_style = (style & !(WS_POPUP.0 | WS_OVERLAPPED.0)) | WS_CHILD.0;
         SetWindowLongW(hwnd, GWL_STYLE, new_style as i32);
@@ -74,16 +76,12 @@ mod desktop_integration {
             (ex_style & !WS_EX_APPWINDOW.0) | WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0;
         SetWindowLongW(hwnd, GWL_EXSTYLE, new_ex_style as i32);
 
-        // Parent to Progman
-        SetParent(hwnd, progman);
+        // Parent to Progman and raise above the icon view.
+        SetParent(hwnd, progman).map_err(|e| format!("SetParent: {e}"))?;
 
-        // Place at the top of Progman's children (above SHELLDLL_DefView)
-        SetWindowPos(
-            hwnd,
-            HWND_TOP,
-            0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        );
+        SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+            .map_err(|e| format!("SetWindowPos: {e}"))?;
 
         Ok(())
     }
@@ -4229,11 +4227,12 @@ impl eframe::App for VisualizerApp {
 fn main() -> eframe::Result<()> {
     let (egui_icon, _) = load_icon();
 
-    let options = eframe::NativeOptions {
+        let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_transparent(true)
             .with_decorations(false)
-            .with_always_on_top(false) // We manage z-order manually via Win32
+            // NOT calling .with_always_on_top() — default is already false.
+            // We control z-order manually via Win32 after the window is created.
             .with_inner_size([1920.0, 1080.0])
             .with_position([0.0, 0.0])
             .with_icon(egui_icon)
