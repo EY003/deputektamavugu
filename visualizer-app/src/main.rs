@@ -1,11 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod overlay;
+
 use eframe::egui;
 use image::DynamicImage;
 use std::f32::consts::TAU;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use visualizer_core::{
     audio::{AudioEngine, BarFrame},
@@ -30,6 +32,9 @@ use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem},
     TrayIcon, TrayIconBuilder,
 };
+
+/// Title of the single overlay window (used to find its HWND).
+const OVERLAY_TITLE: &str = "Rust Visualizer Overlay";
 
 // ═══════════════════════════════════════════════════════════════
 // Icon loader
@@ -565,7 +570,6 @@ struct SettingsState {
     audio_dirty: bool,
     close_requested: bool,
     last_fingerprint: u64,
-    old_settings_scale: f32,
     new_preset_name: String,
     new_audio_preset_name: String,
     last_decay_mode: DecayMode,
@@ -631,9 +635,18 @@ struct VisualizerApp {
     settings_open: Arc<AtomicBool>,
     config_gen: Arc<AtomicU64>,
     seen_gen: u64,
-    was_settings_open: bool,
-    settings_icon: egui::IconData,
     ui_cmd_rx: crossbeam_channel::Receiver<UiCmd>,
+
+    // Single-window overlay state
+    overlay: Option<overlay::Overlay>,
+    overlay_last_try: Instant,
+    settings_rect: Option<egui::Rect>,          // panel rect, window-local points
+    settings_world_min: Option<egui::Pos2>,     // panel top-left, monitor coordinates
+    settings_last_origin: egui::Pos2,
+    settings_last_scale_key: i32,
+    settings_gate_since: Option<Instant>,
+    hot_rect: Arc<Mutex<Option<[f32; 4]>>>,     // panel rect in client px (for the cursor watcher)
+    cursor_inside: Arc<AtomicBool>,
 
     _tray_icon: TrayIcon,
     _hotkey_manager: GlobalHotKeyManager,
@@ -661,7 +674,7 @@ impl VisualizerApp {
             move || smtc_ctx.request_repaint(),
         );
 
-        let (egui_icon, tray_icon_img) = load_icon();
+        let (_, tray_icon_img) = load_icon();
 
         let tray_menu = Menu::new();
         let settings_item = MenuItem::new("Open Settings", true, None);
@@ -723,7 +736,6 @@ impl VisualizerApp {
             audio_dirty: false,
             close_requested: false,
             last_fingerprint: config_fingerprint(&config),
-            old_settings_scale: config.settings_scale,
             new_preset_name: String::new(),
             new_audio_preset_name: String::new(),
             last_decay_mode: config.audio.decay_mode,
@@ -765,9 +777,18 @@ impl VisualizerApp {
             settings_open,
             config_gen: Arc::new(AtomicU64::new(0)),
             seen_gen: 0,
-            was_settings_open: false,
-            settings_icon: egui_icon,
             ui_cmd_rx,
+            overlay: None,
+            overlay_last_try: Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(Instant::now),
+            settings_rect: None,
+            settings_world_min: None,
+            settings_last_origin: egui::Pos2::ZERO,
+            settings_last_scale_key: 0,
+            settings_gate_since: None,
+            hot_rect: Arc::new(Mutex::new(None)),
+            cursor_inside: Arc::new(AtomicBool::new(false)),
             _tray_icon: tray_icon,
             _hotkey_manager: hotkey_manager,
             mesh: MeshBuilder::new(),
@@ -4118,83 +4139,179 @@ fn fft_size_combo(ui: &mut egui::Ui, a: &mut visualizer_core::config::AudioSetti
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Settings viewport
+// Settings panel + input routing (same window as the visualizer)
 // ═══════════════════════════════════════════════════════════════
 
-fn run_settings_viewport(
-    ctx: &egui::Context,
-    shared: &Mutex<SettingsState>,
-    open: &AtomicBool,
-    generation: &AtomicU64,
-) {
-    let mut st = lock_state(shared);
-
-    if ctx.input(|i| i.viewport().close_requested()) {
-        st.config.save();
-        drop(st);
-        open.store(false, Ordering::Relaxed);
-        ctx.request_repaint_of(egui::ViewportId::ROOT);
-        return;
+impl VisualizerApp {
+    /// Locate our own HWND once the window exists and install the z-order hook.
+    fn ensure_overlay(&mut self, ctx: &egui::Context) {
+        if self.overlay.is_some() || self.overlay_last_try.elapsed() < Duration::from_millis(250) {
+            return;
+        }
+        self.overlay_last_try = Instant::now();
+        match overlay::Overlay::attach(OVERLAY_TITLE) {
+            Some(ov) => {
+                overlay::spawn_cursor_watcher(
+                    ctx.clone(),
+                    ov.hwnd(),
+                    self.hot_rect.clone(),
+                    self.cursor_inside.clone(),
+                    self.should_quit.clone(),
+                );
+                self.overlay = Some(ov);
+            }
+            None => ctx.request_repaint_after(Duration::from_millis(250)),
+        }
     }
 
-    if (st.config.settings_scale - st.old_settings_scale).abs() > 0.01 {
-        st.old_settings_scale = st.config.settings_scale;
+    /// Draw the settings panel as an egui window inside the overlay.
+    /// `origin` is the overlay window's top-left in monitor coordinates.
+    fn draw_settings_window(&mut self, ctx: &egui::Context, monitor: egui::Rect, origin: egui::Pos2) {
+        let shared = self.shared.clone();
+        let mut st = lock_state(&shared);
+        st.last_bpm = self.last_bpm;
+        st.current_fps = self.current_fps;
+
+        let ov = origin.to_vec2();
         let scale = st.config.settings_scale.clamp(0.75, 1.5);
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-            560.0 * scale,
-            720.0 * scale,
-        )));
-    }
+        let scale_key = (scale * 100.0).round() as i32;
+        let default_size = (egui::vec2(560.0, 720.0) * scale)
+            .min(monitor.size() - egui::vec2(40.0, 80.0))
+            .max(egui::vec2(380.0, 300.0));
 
-    egui::CentralPanel::default()
-        .frame(egui::Frame::none().fill(egui::Color32::BLACK))
-        .show(ctx, |ui| {
+        let frame = egui::Frame::window(&ctx.style())
+            .fill(egui::Color32::BLACK)
+            .inner_margin(egui::Margin::same(0.0));
+
+        let mut open = true;
+        let mut win = egui::Window::new("Rust Visualizer — Settings")
+            // New id per scale => egui forgets the old size and applies `default_size`.
+            .id(egui::Id::new(("settings_window", scale_key)))
+            .open(&mut open)
+            .frame(frame)
+            .collapsible(false)
+            .resizable(true)
+            .default_size(default_size)
+            .min_size(egui::vec2(380.0, 300.0))
+            .default_pos(monitor.center() - default_size / 2.0 - ov);
+
+        // egui stores the panel position in window-local coordinates. When the
+        // overlay window moves/resizes (or the scale changes) re-place the panel
+        // so it stays put on screen.
+        if origin != self.settings_last_origin || scale_key != self.settings_last_scale_key {
+            if let Some(w) = self.settings_world_min {
+                win = win.current_pos(w - ov);
+            }
+        }
+
+        let resp = win.show(ctx, |ui| {
             st.draw_settings_ui(ui);
         });
 
-    if let Some(idx) = st.pending_audio_preset_delete {
-        egui::Window::new("Confirm Delete")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-            .show(ctx, |ui| {
-                let name = st
-                    .config
-                    .custom_audio_presets
-                    .get(idx)
-                    .map(|p| p.name.clone())
-                    .unwrap_or_default();
-                ui.label(format!("Delete preset '{}'?", name));
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Yes").clicked() {
-                        if idx < st.config.custom_audio_presets.len() {
-                            st.config.custom_audio_presets.remove(idx);
+        match &resp {
+            Some(inner) => {
+                let r = inner.response.rect;
+                self.settings_rect = Some(r);
+                self.settings_world_min = Some(r.min + ov);
+            }
+            None => self.settings_rect = None,
+        }
+        self.settings_last_origin = origin;
+        self.settings_last_scale_key = scale_key;
+
+        if let Some(idx) = st.pending_audio_preset_delete {
+            let center = self
+                .settings_rect
+                .map(|r| r.center())
+                .unwrap_or_else(|| monitor.center() - ov);
+            egui::Window::new("Confirm Delete")
+                .collapsible(false)
+                .resizable(false)
+                .pivot(egui::Align2::CENTER_CENTER)
+                .fixed_pos(center)
+                .show(ctx, |ui| {
+                    let name = st
+                        .config
+                        .custom_audio_presets
+                        .get(idx)
+                        .map(|p| p.name.clone())
+                        .unwrap_or_default();
+                    ui.label(format!("Delete preset '{}'?", name));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Yes").clicked() {
+                            if idx < st.config.custom_audio_presets.len() {
+                                st.config.custom_audio_presets.remove(idx);
+                            }
+                            st.pending_audio_preset_delete = None;
                         }
-                        st.pending_audio_preset_delete = None;
-                    }
-                    if ui.button("No").clicked() {
-                        st.pending_audio_preset_delete = None;
-                    }
+                        if ui.button("No").clicked() {
+                            st.pending_audio_preset_delete = None;
+                        }
+                    });
                 });
-            });
+        }
+
+        let fp = config_fingerprint(&st.config);
+        let changed = st.audio_dirty || fp != st.last_fingerprint;
+        st.last_fingerprint = fp;
+
+        // `!open` = title-bar close button; `close_requested` = in-UI close button.
+        let wants_close = st.close_requested || !open;
+        st.close_requested = false;
+        if wants_close {
+            st.config.save();
+        }
+        drop(st);
+
+        if changed {
+            self.config_gen.fetch_add(1, Ordering::Release);
+            ctx.request_repaint();
+        }
+        if wants_close {
+            self.settings_open.store(false, Ordering::Relaxed);
+            self.settings_rect = None;
+            ctx.request_repaint();
+        }
     }
 
-    let fp = config_fingerprint(&st.config);
-    let changed = st.audio_dirty || fp != st.last_fingerprint;
-    st.last_fingerprint = fp;
+    /// The overlay is click-through, except over the settings panel.
+    fn update_input_passthrough(&mut self, ctx: &egui::Context, settings_open: bool) {
+        let ppp = ctx.pixels_per_point();
+        let mut inside = false;
+        let mut hot: Option<[f32; 4]> = None;
 
-    let wants_close = st.close_requested;
-    st.close_requested = false;
-    drop(st);
+        if settings_open {
+            if let Some(r) = self.settings_rect {
+                // A little slack so the resize handles on the border work.
+                let r = r.expand(8.0);
+                let h = [r.min.x * ppp, r.min.y * ppp, r.max.x * ppp, r.max.y * ppp];
+                hot = Some(h);
+                if let Some((cx, cy)) = self.overlay.as_ref().and_then(|o| o.cursor_client()) {
+                    inside = cx >= h[0] && cx <= h[2] && cy >= h[1] && cy <= h[3];
+                }
+            }
+        }
+        *self.hot_rect.lock().unwrap_or_else(|e| e.into_inner()) = hot;
+        self.cursor_inside.store(inside, Ordering::Relaxed);
 
-    if changed {
-        generation.fetch_add(1, Ordering::Release);
-        ctx.request_repaint_of(egui::ViewportId::ROOT);
-    }
-    if wants_close {
-        open.store(false, Ordering::Relaxed);
-        ctx.request_repaint_of(egui::ViewportId::ROOT);
+        let interactive = settings_open
+            && if self.overlay.is_none() {
+                // HWND not found (should not happen): keep the panel usable.
+                true
+            } else {
+                inside
+                    // dropdowns / colour pickers can extend past the panel
+                    || ctx.memory(|m| m.any_popup_open())
+                    // keep the mouse while dragging or resizing
+                    || (!self.is_passthrough_set && ctx.input(|i| i.pointer.any_down()))
+            };
+
+        let want_passthrough = !interactive;
+        if want_passthrough != self.is_passthrough_set {
+            ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(want_passthrough));
+            self.is_passthrough_set = want_passthrough;
+        }
     }
 }
 
@@ -4258,9 +4375,6 @@ impl eframe::App for VisualizerApp {
             let mut st = lock_state(&self.shared);
             st.active_palettes = self.active_palettes.clone();
             drop(st);
-            if self.settings_open.load(Ordering::Relaxed) {
-                ctx.request_repaint_of(egui::ViewportId::from_hash_of("settings"));
-            }
         }
 
         if self.config.track_info.font_path != self.loaded_font_path {
@@ -4284,16 +4398,18 @@ impl eframe::App for VisualizerApp {
             self.last_bpm = frame.bpm;
         }
 
-        if !self.is_passthrough_set {
-            ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
-            self.is_passthrough_set = true;
-        }
+        self.ensure_overlay(ctx);
 
         // Get the accurate monitor size directly from the viewport info
         let monitor_size = ctx.input(|i| i.viewport().monitor_size).unwrap_or(egui::vec2(1920.0, 1080.0));
         let monitor = egui::Rect::from_min_size(egui::Pos2::ZERO, monitor_size);
 
-        let target = self.compute_overlay_rect(ctx, monitor);
+        let settings_open = self.settings_open.load(Ordering::Relaxed);
+
+        // Rect the visualizer itself needs. While the settings panel is open the
+        // window grows to also cover the whole monitor so the panel fits in it.
+        let vis_rect = self.compute_overlay_rect(ctx, monitor);
+        let target = if settings_open { vis_rect.union(monitor) } else { vis_rect };
 
         let actual_pos = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min)).unwrap_or(egui::Pos2::ZERO);
         let actual_size = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size())).unwrap_or(egui::Vec2::ZERO);
@@ -4304,7 +4420,6 @@ impl eframe::App for VisualizerApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target.min));
         }
 
-        let local_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, target.size());
         let overlay_origin = target.min;
         let painter = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Background,
@@ -4315,7 +4430,8 @@ impl eframe::App for VisualizerApp {
             let c = self.config.bg_color;
             let bg_color =
                 egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], self.config.bg_opacity);
-            painter.rect_filled(local_rect, 0.0, bg_color);
+            // Only the visualizer area gets the background, not the whole (bigger) window.
+            painter.rect_filled(vis_rect.translate(-overlay_origin.to_vec2()), 0.0, bg_color);
         }
 
         self.draw_bars(&painter, ctx, monitor, overlay_origin);
@@ -4333,35 +4449,32 @@ impl eframe::App for VisualizerApp {
             );
         }
 
-        let open = self.settings_open.load(Ordering::Relaxed);
-        let settings_id = egui::ViewportId::from_hash_of("settings");
-        if open {
-            let scale = self.config.settings_scale.clamp(0.75, 1.5);
-            let mut builder = egui::ViewportBuilder::default()
-                .with_title("Rust Visualizer — Settings")
-                .with_inner_size([560.0 * scale, 720.0 * scale])
-                .with_decorations(true)
-                .with_resizable(true)
-                .with_always_on_top();
-            if self.settings_icon.width > 0 {
-                builder = builder.with_icon(self.settings_icon.clone());
+        // ── Settings panel, drawn inside this same overlay window ──
+        if settings_open {
+            // Wait until the OS window has actually grown, otherwise egui would
+            // clamp the panel into the still-small window.
+            let screen = ctx.screen_rect();
+            let ready = screen.width() + 2.0 >= target.width()
+                && screen.height() + 2.0 >= target.height();
+            let since = *self.settings_gate_since.get_or_insert_with(Instant::now);
+            if ready || since.elapsed() > Duration::from_millis(800) {
+                self.draw_settings_window(ctx, monitor, overlay_origin);
+            } else {
+                self.settings_rect = None;
+                ctx.request_repaint();
             }
-
-            if let Ok(mut st) = self.shared.try_lock() {
-                st.last_bpm = self.last_bpm;
-                st.current_fps = self.current_fps;
-            }
-
-            let shared = self.shared.clone();
-            let open_flag = self.settings_open.clone();
-            let generation = self.config_gen.clone();
-            ctx.show_viewport_deferred(settings_id, builder, move |ctx, _class| {
-                run_settings_viewport(ctx, &shared, &open_flag, &generation);
-            });
-        } else if self.was_settings_open {
-            ctx.send_viewport_cmd_to(settings_id, egui::ViewportCommand::Close);
+        } else {
+            self.settings_gate_since = None;
+            self.settings_rect = None;
         }
-        self.was_settings_open = open;
+
+        self.update_input_passthrough(ctx, settings_open);
+
+        // Keep the window just above the desktop icons (e.g. after "Show desktop").
+        if let Some(ov) = self.overlay.as_mut() {
+            ov.tick();
+        }
+        ctx.request_repaint_after(Duration::from_millis(500));
 
         let moving = self.current_bars.iter().any(|&v| v > 0.0005)
             || self.current_peaks.iter().any(|&v| v > 0.0005)
@@ -4386,8 +4499,8 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_transparent(true)
+            .with_title(OVERLAY_TITLE)
             .with_decorations(false)
-            .with_always_on_top()
             .with_inner_size([1280.0, 720.0])
             .with_position([0.0, 0.0])
             .with_icon(egui_icon),
