@@ -16,6 +16,15 @@ crossbeam-channel = "0.5"
 glow = "0.13"
 arc-swap = "1.7"
 
+# Win32 calls for the overlay (z-order above desktop icons, cursor polling)
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 [build-dependencies]
 winres = "0.1"
 
