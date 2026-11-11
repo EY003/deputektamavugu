@@ -32,22 +32,29 @@ use tray_icon::{
 const TARGET_FRAME_TIME: Duration = Duration::from_millis(16);
 
 // ═══════════════════════════════════════════════════════════════
-// Windows: desktop (WorkerW) embedding
+// Windows: z-order positioning (no SetParent, keeps transparency)
 // ═══════════════════════════════════════════════════════════════
 
 #[cfg(target_os = "windows")]
 mod desktop {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use std::ffi::c_void;
-    use std::ptr::null_mut;
-    use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows_sys::Win32::Foundation::HWND;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        FindWindowExW, FindWindowW, SendMessageTimeoutW, SetParent, SetWindowPos, SMTO_NORMAL,
-        SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW,
+        BringWindowToTop, FindWindowW, GetWindow, GetWindowLongPtrW, SetForegroundWindow,
+        SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, GW_HWNDPREV, SWP_NOACTIVATE, SWP_NOMOVE,
+        SWP_NOSIZE, SWP_SHOWWINDOW,
     };
+
+    const WS_EX_NOACTIVATE: isize = 0x0800_0000;
+    const WS_EX_TOOLWINDOW: isize = 0x0000_0080;
 
     fn to_wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    fn hwnd_top() -> HWND {
+        std::ptr::null_mut()
     }
 
     pub fn get_hwnd(frame: &eframe::Frame) -> Option<HWND> {
@@ -58,88 +65,61 @@ mod desktop {
         }
     }
 
-    fn find_workerw() -> HWND {
-        let progman_class = to_wide("Progman");
-        let workerw_class = to_wide("WorkerW");
-        let defview_class = to_wide("SHELLDLL_DefView");
-
+    /// Position the window just above Progman in the top-level z-order.
+    ///
+    ///   [App1] [App2] ... [hwnd (us)] [Progman + icons]
+    ///
+    /// Above the desktop icons; below every other app. Idempotent.
+    pub fn position_above_desktop(hwnd: HWND) {
         unsafe {
-            let progman = FindWindowW(progman_class.as_ptr(), std::ptr::null());
+            let progman = FindWindowW(to_wide("Progman").as_ptr(), std::ptr::null());
             if progman.is_null() {
-                return null_mut();
+                return;
             }
-
-            // Ask Progman to spawn a WorkerW between the wallpaper and the icons.
-            let mut result: usize = 0;
-            let _ = SendMessageTimeoutW(
-                progman,
-                0x052C,
-                0xD as WPARAM,
-                0 as LPARAM,
-                SMTO_NORMAL,
-                1000,
-                &mut result,
+            let above_progman = GetWindow(progman, GW_HWNDPREV);
+            let insert_after = if above_progman.is_null() {
+                hwnd_top()
+            } else {
+                above_progman
+            };
+            SetWindowPos(
+                hwnd,
+                insert_after,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
-            let _ = SendMessageTimeoutW(
-                progman,
-                0x052C,
-                0xD as WPARAM,
-                1 as LPARAM,
-                SMTO_NORMAL,
-                1000,
-                &mut result,
-            );
-
-            // Prefer a WorkerW that does NOT contain the icon view; that's the
-            // "back" layer we want to host the visualizer.
-            let mut h =
-                FindWindowExW(null_mut(), null_mut(), workerw_class.as_ptr(), std::ptr::null());
-            while !h.is_null() {
-                let defview =
-                    FindWindowExW(h, null_mut(), defview_class.as_ptr(), std::ptr::null());
-                if defview.is_null() {
-                    return h;
-                }
-                h = FindWindowExW(null_mut(), h, workerw_class.as_ptr(), std::ptr::null());
-            }
-
-            // Fallback: any WorkerW child of Progman.
-            FindWindowExW(progman, null_mut(), workerw_class.as_ptr(), std::ptr::null())
         }
     }
 
-    pub fn embed_in_workerw(hwnd: HWND, width: i32, height: i32) -> bool {
-        let workerw = find_workerw();
-        if workerw.is_null() {
-            return false;
-        }
+    /// Background overlay mode: no focus, no taskbar, no alt-tab.
+    pub fn make_background_window(hwnd: HWND) {
         unsafe {
-            SetParent(hwnd, workerw);
-            SetWindowPos(
-                hwnd,
-                null_mut(),
-                0,
-                0,
-                width,
-                height,
-                SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            );
+            let current = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            let new_style = current | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style);
         }
-        true
     }
 
-    pub fn detach_to_top_level(hwnd: HWND, x: i32, y: i32, width: i32, height: i32) {
+    /// Interactive mode: appears in alt-tab, can receive focus, brought to top.
+    pub fn make_interactive_window(hwnd: HWND) {
         unsafe {
-            SetParent(hwnd, null_mut());
+            let current = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            let new_style = current & !WS_EX_NOACTIVATE & !WS_EX_TOOLWINDOW;
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style);
             SetWindowPos(
                 hwnd,
-                null_mut(),
-                x,
-                y,
-                width,
-                height,
-                SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                hwnd_top(),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
             );
+            BringWindowToTop(hwnd);
+            SetForegroundWindow(hwnd);
         }
     }
 }
@@ -742,6 +722,7 @@ struct VisualizerApp {
     settings_open: bool,
     needs_mode_change: bool,
     initialized: bool,
+    passthrough_active: bool,
     ui_cmd_rx: crossbeam_channel::Receiver<UiCmd>,
 
     _tray_icon: TrayIcon,
@@ -874,6 +855,7 @@ impl VisualizerApp {
             settings_open,
             needs_mode_change: false,
             initialized: false,
+            passthrough_active: false,
             ui_cmd_rx,
             _tray_icon: tray_icon,
             _hotkey_manager: hotkey_manager,
@@ -890,29 +872,20 @@ impl VisualizerApp {
         }
     }
 
-    fn apply_window_mode(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+    fn apply_window_mode(&mut self, _ctx: &egui::Context, frame: &eframe::Frame) {
         #[cfg(target_os = "windows")]
         {
             let Some(hwnd) = desktop::get_hwnd(frame) else { return };
-            let monitor_size = ctx
-                .input(|i| i.viewport().monitor_size)
-                .unwrap_or(egui::vec2(1920.0, 1080.0));
-            let w = monitor_size.x as i32;
-            let h = monitor_size.y as i32;
-
             if self.settings_open {
-                desktop::detach_to_top_level(hwnd, 0, 0, w, h);
-                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-                    egui::viewport::WindowLevel::AlwaysOnTop,
-                ));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                desktop::make_interactive_window(hwnd);
             } else {
-                desktop::embed_in_workerw(hwnd, w, h);
+                desktop::make_background_window(hwnd);
+                desktop::position_above_desktop(hwnd);
             }
         }
         #[cfg(not(target_os = "windows"))]
         {
-            let _ = (ctx, frame);
+            let _ = frame;
         }
     }
 
@@ -1005,8 +978,6 @@ impl VisualizerApp {
             self.config.save();
         }
     }
-
-    // ── Palette updates ───────────────────────────────────────
 
     fn update_palettes(&mut self) {
         match self.config.color_mode {
@@ -1152,8 +1123,6 @@ impl VisualizerApp {
         h.finish()
     }
 
-    // ── Track updates ─────────────────────────────────────────
-
     fn poll_track_updates(&mut self, ctx: &egui::Context) {
         while let Ok(info) = self.track_rx.try_recv() {
             if let Some(bytes) = &info.cover_art {
@@ -1206,8 +1175,6 @@ impl VisualizerApp {
         ctx.set_fonts(fonts);
         self.loaded_font_path = target;
     }
-
-    // ── Color helpers ─────────────────────────────────────────
 
     fn get_visualizer_text_color(&self, time: f32) -> [u8; 3] {
         match self.config.color_mode {
@@ -1575,8 +1542,6 @@ impl VisualizerApp {
         }
     }
 
-    // ── Track info drawing ────────────────────────────────────
-
     fn draw_styled_text(
         &self,
         ctx: &egui::Context,
@@ -1706,8 +1671,6 @@ impl VisualizerApp {
             );
         }
     }
-
-    // ── Bars ─────────────────────────────────────────────────
 
     fn draw_bars(
         &mut self,
@@ -4272,6 +4235,25 @@ impl eframe::App for VisualizerApp {
             self.apply_window_mode(ctx, frame);
         }
 
+        // Keep the window positioned just above the desktop but below other apps.
+        // New apps that open will appear above us; this call re-asserts our
+        // preferred z-order so we stay visible on the desktop. Skip while
+        // settings is open (interactive mode).
+        #[cfg(target_os = "windows")]
+        if !self.settings_open {
+            if let Some(hwnd) = desktop::get_hwnd(frame) {
+                desktop::position_above_desktop(hwnd);
+            }
+        }
+
+        // Pointer passthrough: let clicks pass through to desktop icons when
+        // the settings panel isn't open.
+        let want_passthrough = !self.settings_open;
+        if self.passthrough_active != want_passthrough {
+            ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(want_passthrough));
+            self.passthrough_active = want_passthrough;
+        }
+
         self.poll_track_updates(ctx);
 
         let new_hash = self.palette_fingerprint();
@@ -4365,6 +4347,7 @@ fn main() -> eframe::Result<()> {
             .with_decorations(false)
             .with_inner_size([1920.0, 1080.0])
             .with_position([0.0, 0.0])
+            .with_active(false)
             .with_icon(egui_icon),
         vsync: true,
         ..Default::default()
