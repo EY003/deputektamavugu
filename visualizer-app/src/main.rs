@@ -32,20 +32,26 @@ use tray_icon::{
 };
 
 // Windows-specific desktop integration
+// Windows-specific desktop integration
 #[cfg(target_os = "windows")]
 mod desktop_integration {
+    use std::ffi::CString;
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
         FindWindowA, FindWindowExA, GetWindowLongW, SetParent, SetWindowLongW, SetWindowPos,
         GWL_EXSTYLE, GWL_STYLE, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
         WS_CHILD, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPED, WS_POPUP,
     };
-    use windows::core::s;
+    use windows::core::{s, PCSTR};
 
     /// Attach the given window (by title) to the Windows desktop.
     /// The window will sit above desktop icons but below normal application windows.
     pub unsafe fn attach_to_desktop(window_title: &str) -> Result<(), String> {
-        let hwnd = FindWindowA(None, s!(window_title));
+        // s!() only accepts literals, so build a PCSTR from the runtime &str.
+        let title_cstr = CString::new(window_title).map_err(|e| e.to_string())?;
+        let title_pcstr = PCSTR::from_raw(title_cstr.as_ptr() as *const u8);
+
+        let hwnd = FindWindowA(None, title_pcstr);
         if hwnd.0 == 0 {
             return Err("Window not found".into());
         }
@@ -64,7 +70,8 @@ mod desktop_integration {
         SetWindowLongW(hwnd, GWL_STYLE, new_style as i32);
 
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
-        let new_ex_style = (ex_style & !WS_EX_APPWINDOW.0) | WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0;
+        let new_ex_style =
+            (ex_style & !WS_EX_APPWINDOW.0) | WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0;
         SetWindowLongW(hwnd, GWL_EXSTYLE, new_ex_style as i32);
 
         // Parent to Progman
