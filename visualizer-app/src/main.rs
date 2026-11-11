@@ -12,12 +12,12 @@ use visualizer_core::{
     color,
     config::{
         self as cfg,
-        AppConfig, AudioPreset, BarInterpolation, BeatFocusMode, BlendMode, ChannelMixMode,
-        ColorChangePreset, ColorMode, ColorPreset, ColorSource, CustomAudioPreset, DecayMode,
-        FrequencyDirection, FrequencyScaling, GradientPreset, GradientSource, GradientStop,
-        MotionShape, PalettePriority, StaticDistributionMode, StaticMultiPreset,
+        AppConfig, AudioPreset, BarInterpolation, BlendMode,
+        ColorMode, ColorSource, CustomAudioPreset, DecayMode,
+        FrequencyDirection, GradientSource, GradientStop,
+        MotionShape, PalettePriority, StaticDistributionMode,
         TrackInfoConfig, TrackTextAlign, TrackTextColorMode, VerticalColorStyle,
-        VisualizerDirection, WeightingCurve, WindowFunction,
+        VisualizerDirection,
     },
     musicbee::{self, TrackInfo},
 };
@@ -32,7 +32,6 @@ use tray_icon::{
 };
 
 // Windows-specific desktop integration
-// Windows-specific desktop integration
 #[cfg(target_os = "windows")]
 mod desktop_integration {
     use std::ffi::CString;
@@ -46,27 +45,23 @@ mod desktop_integration {
     /// Attach the given window (by title) to the Windows desktop.
     /// The window will sit above desktop icons but below normal application windows.
     pub unsafe fn attach_to_desktop(window_title: &str) -> Result<(), String> {
-        // s!() only accepts literals, so build a PCSTR from the runtime &str.
         let title_cstr = CString::new(window_title).map_err(|e| e.to_string())?;
         let title_pcstr = PCSTR::from_raw(title_cstr.as_ptr() as *const u8);
 
-        // windows 0.58: these functions return Result<HWND>, not HWND.
         let hwnd = FindWindowA(None, title_pcstr)
             .map_err(|e| format!("FindWindowA(target): {e}"))?;
-        if hwnd.0 == 0 {
+        if hwnd.0.is_null() {
             return Err("target window handle is null".into());
         }
 
         let progman = FindWindowA(s!("Progman"), None)
             .map_err(|e| format!("FindWindowA(Progman): {e}"))?;
-        if progman.0 == 0 {
+        if progman.0.is_null() {
             return Err("Progman handle is null".into());
         }
 
-        // Best-effort: make sure SHELLDLL_DefView exists.
         let _ = FindWindowExA(progman, None, s!("SHELLDLL_DefView"), None);
 
-        // Convert to a child window.
         let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
         let new_style = (style & !(WS_POPUP.0 | WS_OVERLAPPED.0)) | WS_CHILD.0;
         SetWindowLongW(hwnd, GWL_STYLE, new_style as i32);
@@ -76,7 +71,6 @@ mod desktop_integration {
             (ex_style & !WS_EX_APPWINDOW.0) | WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0;
         SetWindowLongW(hwnd, GWL_EXSTYLE, new_ex_style as i32);
 
-        // Parent to Progman and raise above the icon view.
         SetParent(hwnd, progman).map_err(|e| format!("SetParent: {e}"))?;
 
         SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0,
