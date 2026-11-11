@@ -21,8 +21,8 @@
 //!   has `WS_EX_APPWINDOW` cleared.  Winit rewrites the extended style whenever
 //!   the click-through flag is toggled, so the flags are re-applied from
 //!   `WM_STYLECHANGING`.
-//! * `WM_ERASEBKGND` is intercepted to prevent Windows from painting the
-//!   background black when the window is focused.
+//! * DWM composition is explicitly configured to keep the window transparent
+//!   even when it gains focus (which normally paints the window background black).
 
 use eframe::egui;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
@@ -30,6 +30,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows_sys::Win32::Graphics::Dwm::{
+    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, MARGINS,
+    DWMWA_NCRENDERING_POLICY, DWMWA_TRANSITIONS_FORCEDISABLED, DWMNCRP_DISABLED,
+};
 use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
 use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
@@ -37,8 +41,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowExW, GetCursorPos, GetWindow, GetWindowLongPtrW, GetWindowTextW,
     GetWindowThreadProcessId, IsWindow, IsWindowVisible, SetWindowLongPtrW, SetWindowPos,
     ShowWindow, GWL_EXSTYLE, GW_HWNDPREV, STYLESTRUCT, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SW_HIDE, SW_SHOWNA, WINDOWPOS, WM_ERASEBKGND, WM_STYLECHANGING,
-    WM_WINDOWPOSCHANGING, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    SWP_NOZORDER, SW_HIDE, SW_SHOWNA, WINDOWPOS, WM_ERASEBKGND, WM_NCACTIVATE, WM_NCPAINT,
+    WM_STYLECHANGING, WM_WINDOWPOSCHANGING, WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
 };
 
 /// Hide the overlay from the taskbar / Alt-Tab (also keeps it from being
@@ -148,9 +152,17 @@ unsafe extern "system" fn subclass_proc(
     _ref_data: usize,
 ) -> LRESULT {
     match msg {
-        // Prevent the OS from painting a solid black background when focused.
+        // Prevent the OS from painting the background (black) on focus or resize.
         WM_ERASEBKGND => {
             return 1;
+        }
+        // Prevent Windows from drawing the non-client area when activated.
+        WM_NCACTIVATE => {
+            return 1;
+        }
+        // Prevent Windows from painting the non-client border.
+        WM_NCPAINT => {
+            return 0;
         }
         // Whenever something (activation, click, ...) tries to re-order *our*
         // window, redirect it to "directly above the desktop icons".
@@ -161,12 +173,15 @@ unsafe extern "system" fn subclass_proc(
                 wp.hwndInsertAfter = host as HWND;
             }
         }
-        // Keep WS_EX_TOOLWINDOW (and no WS_EX_APPWINDOW) even if winit rewrites
-        // the extended style.
-        WM_STYLECHANGING if HIDE_FROM_TASKBAR && (wparam as i32) == GWL_EXSTYLE => {
+        // Keep WS_EX_TOOLWINDOW and WS_EX_LAYERED even if winit rewrites the style.
+        WM_STYLECHANGING if (wparam as i32) == GWL_EXSTYLE => {
             let ss = &mut *(lparam as *mut STYLESTRUCT);
-            ss.styleNew |= WS_EX_TOOLWINDOW;
-            ss.styleNew &= !WS_EX_APPWINDOW;
+            if HIDE_FROM_TASKBAR {
+                ss.styleNew |= WS_EX_TOOLWINDOW;
+                ss.styleNew &= !WS_EX_APPWINDOW;
+            }
+            // Force layered to ensure DWM transparency persists.
+            ss.styleNew |= WS_EX_LAYERED;
         }
         _ => {}
     }
@@ -192,6 +207,28 @@ impl Overlay {
         unsafe {
             SetWindowSubclass(hwnd as HWND, Some(subclass_proc), SUBCLASS_ID, 0);
 
+            // Fix for black background on focus: extend DWM frame into the whole client area
+            let margins = MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 };
+            DwmExtendFrameIntoClientArea(hwnd as HWND, &margins);
+
+            // Disable DWM transitions (which cause flickering/black backgrounds on focus)
+            let mut disabled: i32 = 1;
+            DwmSetWindowAttribute(
+                hwnd as HWND,
+                DWMWA_TRANSITIONS_FORCEDISABLED as u32,
+                &mut disabled as *mut _ as _,
+                std::mem::size_of::<i32>() as u32,
+            );
+
+            // Disable non-client rendering entirely
+            let mut nc_policy: i32 = DWMNCRP_DISABLED as i32;
+            DwmSetWindowAttribute(
+                hwnd as HWND,
+                DWMWA_NCRENDERING_POLICY as u32,
+                &mut nc_policy as *mut _ as _,
+                std::mem::size_of::<i32>() as u32,
+            );
+
             if HIDE_FROM_TASKBAR {
                 // Hide/show so the shell drops the existing taskbar button.
                 let was_visible = IsWindowVisible(hwnd as HWND) != 0;
@@ -199,7 +236,8 @@ impl Overlay {
                     ShowWindow(hwnd as HWND, SW_HIDE);
                 }
                 let ex = GetWindowLongPtrW(hwnd as HWND, GWL_EXSTYLE) as isize;
-                let new_ex = (ex | WS_EX_TOOLWINDOW as isize) & !(WS_EX_APPWINDOW as isize);
+                let new_ex = (ex | WS_EX_TOOLWINDOW as isize | WS_EX_LAYERED as isize)
+                    & !(WS_EX_APPWINDOW as isize);
                 SetWindowLongPtrW(hwnd as HWND, GWL_EXSTYLE, new_ex as _);
                 if was_visible {
                     ShowWindow(hwnd as HWND, SW_SHOWNA);
