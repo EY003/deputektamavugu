@@ -35,98 +35,48 @@ use tray_icon::{
 #[cfg(target_os = "windows")]
 mod desktop_integration {
     use std::ffi::CString;
-    use windows::Win32::Foundation::{HWND, BOOL, LPARAM, WPARAM, COLORREF};
     use windows::Win32::UI::WindowsAndMessaging::{
-        FindWindowA, FindWindowExA, GetWindowLongW, SetParent, SetWindowLongW, SetWindowPos,
-        SetLayeredWindowAttributes, EnumWindows, SendMessageTimeoutA, SetClassLongPtrW,
-        GWL_EXSTYLE, GWL_STYLE, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_FRAMECHANGED,
-        WS_CHILD, WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPED, WS_POPUP,
-        GCLP_HBRBACKGROUND, LWA_ALPHA, SMTO_NORMAL,
+        FindWindowA, GetWindowLongW, SetWindowLongW, SetWindowPos, GetWindow,
+        GWL_EXSTYLE, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_FRAMECHANGED,
+        WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_EX_NOACTIVATE, GW_HWNDPREV,
     };
     use windows::core::{s, PCSTR};
 
-    // Helper to find the WorkerW window that hosts the wallpaper
-    unsafe extern "system" fn enum_window(window: HWND, ref_worker_w: LPARAM) -> BOOL {
-        unsafe {
-            // Pass HWND::default() for NULL
-            let shell_dll_def_view = FindWindowExA(window, HWND::default(), s!("SHELLDLL_DefView"), None)
-                .unwrap_or_default();
-                
-            if !shell_dll_def_view.is_invalid() {
-                // Found the icon view. The WorkerW we want is the *next* sibling.
-                let worker_w = FindWindowExA(HWND::default(), window, s!("WorkerW"), None)
-                    .unwrap_or_default();
-                    
-                if !worker_w.is_invalid() {
-                    *(ref_worker_w.0 as *mut HWND) = worker_w;
-                    return false.into(); // Stop enumerating
-                }
-            }
-            true.into() // Continue
-        }
-    }
-
-    /// Attach the given window (by title) to the Windows desktop's wallpaper layer.
-    /// The window will sit above the desktop wallpaper but below normal application windows.
+    /// Place the window in the Z-order right above the desktop icons, but below normal apps.
     pub unsafe fn attach_to_desktop(window_title: &str) -> Result<(), String> {
         let title_cstr = CString::new(window_title).map_err(|e| e.to_string())?;
         let title_pcstr = PCSTR::from_raw(title_cstr.as_ptr() as *const u8);
 
-        // Find our window
-        let hwnd = FindWindowA(None, title_pcstr)
-            .map_err(|e| format!("FindWindowA(target): {e}"))?;
+        let hwnd = FindWindowA(None, title_pcstr).map_err(|e| format!("FindWindowA: {e}"))?;
         if hwnd.is_invalid() {
             return Err("target window handle is null".into());
         }
 
-        // 1. Find the top-level Progman window
-        let progman = FindWindowA(s!("Progman"), None)
-            .map_err(|e| format!("FindWindowA(Progman): {e}"))?;
-        if progman.is_invalid() {
-            return Err("Progman handle is null".into());
-        }
-
-        // 2. Send the magic message to Progman to spawn the WorkerW if needed
-        let _ = SendMessageTimeoutA(progman, 0x052C, WPARAM(0), LPARAM(0), SMTO_NORMAL, 1000, None);
-
-        // 3. Enumerate windows to find the correct WorkerW sibling
-        let mut worker_w = HWND::default();
-        let _ = EnumWindows(Some(enum_window), LPARAM(&mut worker_w as *mut HWND as _));
-
-        // Fallback: if the WorkerW sibling wasn't found, try a direct child
-        if worker_w.is_invalid() {
-            worker_w = FindWindowExA(progman, HWND::default(), s!("WorkerW"), None)
-                .unwrap_or_default();
-        }
-        if worker_w.is_invalid() {
-            return Err("Failed to find WorkerW window".into());
-        }
-
-        // 4. Modify styles for a child, layered window
-        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
-        let new_style = (style & !(WS_POPUP.0 | WS_OVERLAPPED.0)) | WS_CHILD.0;
-        SetWindowLongW(hwnd, GWL_STYLE, new_style as i32);
-
+        // 1. Remove from Alt+Tab and prevent stealing focus when clicked.
+        // We keep WS_EX_LAYERED out of here because eframe handles its own transparency natively.
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
-        let new_ex_style =
-            (ex_style & !WS_EX_APPWINDOW.0) | WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0 | WS_EX_LAYERED.0;
+        let new_ex_style = (ex_style & !WS_EX_APPWINDOW.0) | WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0;
         SetWindowLongW(hwnd, GWL_EXSTYLE, new_ex_style as i32);
 
-        // Remove background brush to prevent black painting
-        SetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND, 0);
-
-        // 5. Parent to the WorkerW window
-        SetParent(hwnd, worker_w).map_err(|e| format!("SetParent: {e}"))?;
-
-        // 6. Explicitly set transparency attributes
-        // LWA_ALPHA with 255 tells the DWM to respect the window's per-pixel alpha channel.
-        SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA)
-            .map_err(|e| format!("SetLayeredWindowAttributes: {e}"))?;
-
-        // 7. Force the DWM to update the window frame
-        SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED)
-            .map_err(|e| format!("SetWindowPos: {e}"))?;
+        // 2. Find the desktop window (Progman)
+        let progman = FindWindowA(s!("Progman"), None).unwrap_or_default();
+        
+        if !progman.is_invalid() {
+            // Find the window that is currently directly ABOVE the desktop, and place ourselves there.
+            let mut insert_after = GetWindow(progman, GW_HWNDPREV).unwrap_or_default();
+            if insert_after.is_invalid() {
+                insert_after = HWND_TOP;
+            }
+            
+            SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, 
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED)
+                .map_err(|e| format!("SetWindowPos: {e}"))?;
+        } else {
+            // Fallback if Progman isn't found
+            SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, 
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED)
+                .map_err(|e| format!("SetWindowPos: {e}"))?;
+        }
 
         Ok(())
     }
