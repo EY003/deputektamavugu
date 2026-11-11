@@ -37,8 +37,9 @@ mod desktop_integration {
     use std::ffi::CString;
     use windows::Win32::UI::WindowsAndMessaging::{
         FindWindowA, FindWindowExA, GetWindowLongW, SetParent, SetWindowLongW, SetWindowPos,
-        GWL_EXSTYLE, GWL_STYLE, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-        WS_CHILD, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPED, WS_POPUP,
+        GWL_EXSTYLE, GWL_STYLE, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_FRAMECHANGED,
+        WS_CHILD, WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPED, WS_POPUP,
+        SetClassLongPtrW, GCLP_HBRBACKGROUND,
     };
     use windows::core::{s, PCSTR};
 
@@ -62,19 +63,26 @@ mod desktop_integration {
 
         let _ = FindWindowExA(progman, None, s!("SHELLDLL_DefView"), None);
 
+        // 1. Convert to child window
         let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
         let new_style = (style & !(WS_POPUP.0 | WS_OVERLAPPED.0)) | WS_CHILD.0;
         SetWindowLongW(hwnd, GWL_STYLE, new_style as i32);
 
+        // 2. Explicitly ensure WS_EX_LAYERED is preserved
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
         let new_ex_style =
-            (ex_style & !WS_EX_APPWINDOW.0) | WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0;
+            (ex_style & !WS_EX_APPWINDOW.0) | WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0 | WS_EX_LAYERED.0;
         SetWindowLongW(hwnd, GWL_EXSTYLE, new_ex_style as i32);
 
+        // 3. Remove the default background brush so it doesn't paint black
+        SetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND, 0);
+
+        // 4. Parent to Progman
         SetParent(hwnd, progman).map_err(|e| format!("SetParent: {e}"))?;
 
+        // 5. Force DWM to update the frame with the new styles
         SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED)
             .map_err(|e| format!("SetWindowPos: {e}"))?;
 
         Ok(())
