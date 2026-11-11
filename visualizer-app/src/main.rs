@@ -4527,7 +4527,7 @@ impl eframe::App for VisualizerApp {
         // This prevents the window from moving when the user drags a slider that changes
         // the visualizer's size or position, eliminating all slider glitching.
         let target = if settings_open {
-            monitor
+            egui::Rect::from_min_size(monitor.min, monitor.size() - egui::vec2(0.0, 1.0))
         } else {
             vis_rect
         };
