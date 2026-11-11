@@ -12,12 +12,10 @@ use visualizer_core::{
     color,
     config::{
         self as cfg,
-        AppConfig, AudioPreset, BarInterpolation, BeatFocusMode, BlendMode, ChannelMixMode,
-        ColorChangePreset, ColorMode, ColorPreset, ColorSource, CustomAudioPreset, DecayMode,
-        FrequencyDirection, FrequencyScaling, GradientPreset, GradientSource, GradientStop,
-        MotionShape, PalettePriority, StaticDistributionMode, StaticMultiPreset,
-        TrackInfoConfig, TrackTextAlign, TrackTextColorMode, VerticalColorStyle,
-        VisualizerDirection, WeightingCurve, WindowFunction,
+        AppConfig, AudioPreset, BarInterpolation, BlendMode, ColorMode, ColorSource,
+        CustomAudioPreset, DecayMode, FrequencyDirection, GradientSource, GradientStop,
+        MotionShape, PalettePriority, StaticDistributionMode, TrackInfoConfig, TrackTextAlign,
+        TrackTextColorMode, VerticalColorStyle, VisualizerDirection,
     },
     musicbee::{self, TrackInfo},
 };
@@ -40,6 +38,8 @@ const TARGET_FRAME_TIME: Duration = Duration::from_millis(16);
 #[cfg(target_os = "windows")]
 mod desktop {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use std::ffi::c_void;
+    use std::ptr::null_mut;
     use windows_sys::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         FindWindowExW, FindWindowW, SendMessageTimeoutW, SetParent, SetWindowPos, SMTO_NORMAL,
@@ -53,7 +53,7 @@ mod desktop {
     pub fn get_hwnd(frame: &eframe::Frame) -> Option<HWND> {
         let handle = frame.window_handle().ok()?;
         match handle.as_raw() {
-            RawWindowHandle::Win32(w) => Some(w.hwnd.get() as HWND),
+            RawWindowHandle::Win32(w) => Some(w.hwnd.get() as *mut c_void),
             _ => None,
         }
     }
@@ -65,11 +65,11 @@ mod desktop {
 
         unsafe {
             let progman = FindWindowW(progman_class.as_ptr(), std::ptr::null());
-            if progman == 0 {
-                return 0;
+            if progman.is_null() {
+                return null_mut();
             }
 
-            // Ask Progman to spawn a WorkerW for us.
+            // Ask Progman to spawn a WorkerW between the wallpaper and the icons.
             let mut result: usize = 0;
             let _ = SendMessageTimeoutW(
                 progman,
@@ -90,32 +90,34 @@ mod desktop {
                 &mut result,
             );
 
-            // Find a WorkerW that does NOT contain the icon view — that's the
-            // "back" layer that sits between the wallpaper and the icons.
-            let mut h = FindWindowExW(0, 0, workerw_class.as_ptr(), std::ptr::null());
-            while h != 0 {
-                let defview = FindWindowExW(h, 0, defview_class.as_ptr(), std::ptr::null());
-                if defview == 0 {
+            // Prefer a WorkerW that does NOT contain the icon view; that's the
+            // "back" layer we want to host the visualizer.
+            let mut h =
+                FindWindowExW(null_mut(), null_mut(), workerw_class.as_ptr(), std::ptr::null());
+            while !h.is_null() {
+                let defview =
+                    FindWindowExW(h, null_mut(), defview_class.as_ptr(), std::ptr::null());
+                if defview.is_null() {
                     return h;
                 }
-                h = FindWindowExW(0, h, workerw_class.as_ptr(), std::ptr::null());
+                h = FindWindowExW(null_mut(), h, workerw_class.as_ptr(), std::ptr::null());
             }
 
-            // Fallback: use any WorkerW child of Progman.
-            FindWindowExW(progman, 0, workerw_class.as_ptr(), std::ptr::null())
+            // Fallback: any WorkerW child of Progman.
+            FindWindowExW(progman, null_mut(), workerw_class.as_ptr(), std::ptr::null())
         }
     }
 
     pub fn embed_in_workerw(hwnd: HWND, width: i32, height: i32) -> bool {
         let workerw = find_workerw();
-        if workerw == 0 {
+        if workerw.is_null() {
             return false;
         }
         unsafe {
             SetParent(hwnd, workerw);
             SetWindowPos(
                 hwnd,
-                0,
+                null_mut(),
                 0,
                 0,
                 width,
@@ -128,10 +130,10 @@ mod desktop {
 
     pub fn detach_to_top_level(hwnd: HWND, x: i32, y: i32, width: i32, height: i32) {
         unsafe {
-            SetParent(hwnd, 0);
+            SetParent(hwnd, null_mut());
             SetWindowPos(
                 hwnd,
-                0,
+                null_mut(),
                 x,
                 y,
                 width,
@@ -844,7 +846,7 @@ impl VisualizerApp {
             system_fonts: list_system_fonts(),
         }));
 
-        let _ = egui_icon; // icon kept for possible future use
+        let _ = egui_icon;
 
         Self {
             current_bars: vec![0.0; num_bars],
@@ -921,7 +923,6 @@ impl VisualizerApp {
 
         let mut st = lock_state(&self.shared);
 
-        // Dim backdrop
         let screen_rect = ctx.screen_rect();
         let backdrop_painter = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Middle,
@@ -929,7 +930,6 @@ impl VisualizerApp {
         ));
         backdrop_painter.rect_filled(screen_rect, 0.0, egui::Color32::from_black_alpha(150));
 
-        // Main window
         let mut window_open = true;
         egui::Window::new("Rust Visualizer — Settings")
             .open(&mut window_open)
@@ -941,7 +941,6 @@ impl VisualizerApp {
                 st.draw_settings_ui(ui);
             });
 
-        // Delete confirmation dialog
         if let Some(idx) = st.pending_audio_preset_delete {
             egui::Window::new("Confirm Delete")
                 .collapsible(false)
@@ -970,7 +969,6 @@ impl VisualizerApp {
                 });
         }
 
-        // Handle close
         let close = st.close_requested || !window_open;
         st.close_requested = false;
 
@@ -982,7 +980,6 @@ impl VisualizerApp {
             return;
         }
 
-        // Propagate config changes to the visualizer
         let fp = config_fingerprint(&st.config);
         let changed = st.audio_dirty || fp != st.last_fingerprint;
         st.last_fingerprint = fp;
@@ -4236,7 +4233,6 @@ impl eframe::App for VisualizerApp {
             ctx.set_pixels_per_point(1.0);
         }
 
-        // ── Process UI commands from tray/hotkey threads ─────────
         while let Ok(cmd) = self.ui_cmd_rx.try_recv() {
             match cmd {
                 UiCmd::OpenSettings => {
@@ -4261,7 +4257,6 @@ impl eframe::App for VisualizerApp {
             return;
         }
 
-        // ── First-frame initialization ───────────────────────────
         if !self.initialized {
             self.initialized = true;
             let monitor_size = ctx
@@ -4272,15 +4267,10 @@ impl eframe::App for VisualizerApp {
             self.apply_window_mode(ctx, frame);
         }
 
-        // ── Apply any pending window-mode changes ────────────────
         if self.needs_mode_change {
             self.needs_mode_change = false;
             self.apply_window_mode(ctx, frame);
         }
-
-        // ── Sync config from settings state to runtime state ────
-        // (This is driven from draw_settings_overlay when settings is open;
-        //  while closed, self.config is authoritative and just stays put.)
 
         self.poll_track_updates(ctx);
 
@@ -4311,7 +4301,6 @@ impl eframe::App for VisualizerApp {
             self.last_bpm = f.bpm;
         }
 
-        // ── Draw ─────────────────────────────────────────────────
         let monitor_size = ctx
             .input(|i| i.viewport().monitor_size)
             .unwrap_or(egui::vec2(1920.0, 1080.0));
@@ -4344,12 +4333,10 @@ impl eframe::App for VisualizerApp {
             );
         }
 
-        // ── Settings overlay (in-window, no extra surface) ──────
         if self.settings_open {
             self.draw_settings_overlay(ctx);
         }
 
-        // ── Schedule repaint ─────────────────────────────────────
         let moving = self.current_bars.iter().any(|&v| v > 0.0005)
             || self.current_peaks.iter().any(|&v| v > 0.0005)
             || self.config.color_mode == ColorMode::Animated
