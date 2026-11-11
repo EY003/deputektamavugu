@@ -12,12 +12,12 @@ use visualizer_core::{
     color,
     config::{
         self as cfg,
-        AppConfig, AudioPreset, BarInterpolation, BlendMode,
-        ColorMode, ColorSource, CustomAudioPreset, DecayMode,
-        FrequencyDirection, GradientSource, GradientStop,
-        MotionShape, PalettePriority, StaticDistributionMode,
+        AppConfig, AudioPreset, BarInterpolation, BeatFocusMode, BlendMode, ChannelMixMode,
+        ColorChangePreset, ColorMode, ColorPreset, ColorSource, CustomAudioPreset, DecayMode,
+        FrequencyDirection, FrequencyScaling, GradientPreset, GradientSource, GradientStop,
+        MotionShape, PalettePriority, StaticDistributionMode, StaticMultiPreset,
         TrackInfoConfig, TrackTextAlign, TrackTextColorMode, VerticalColorStyle,
-        VisualizerDirection,
+        VisualizerDirection, WeightingCurve, WindowFunction,
     },
     musicbee::{self, TrackInfo},
 };
@@ -31,56 +31,6 @@ use tray_icon::{
     TrayIcon, TrayIconBuilder,
 };
 
-// Windows-specific desktop integration
-#[cfg(target_os = "windows")]
-mod desktop_integration {
-    use std::ffi::CString;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        FindWindowA, GetWindowLongW, SetWindowLongW, SetWindowPos, GetWindow,
-        GWL_EXSTYLE, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-        WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, GW_HWNDPREV,
-    };
-    use windows::core::{s, PCSTR};
-
-    pub unsafe fn attach_to_desktop(window_title: &str) -> Result<(), String> {
-        let title_cstr = CString::new(window_title).map_err(|e| e.to_string())?;
-        let title_pcstr = PCSTR::from_raw(title_cstr.as_ptr() as *const u8);
-        
-        let hwnd = FindWindowA(None, title_pcstr).map_err(|e| format!("FindWindowA: {e}"))?;
-        if hwnd.is_invalid() {
-            return Err("target window handle is null".into());
-        }
-
-        // Remove from Alt+Tab
-        let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
-        let new_ex_style = (ex_style & !WS_EX_APPWINDOW.0) | WS_EX_TOOLWINDOW.0;
-        SetWindowLongW(hwnd, GWL_EXSTYLE, new_ex_style as i32);
-
-        enforce_z_order(window_title);
-        Ok(())
-    }
-
-    /// Constantly pins the window to the exact Z-order above the desktop icons.
-    pub unsafe fn enforce_z_order(window_title: &str) {
-        let title_cstr = CString::new(window_title).unwrap();
-        let title_pcstr = PCSTR::from_raw(title_cstr.as_ptr() as *const u8);
-        let hwnd = FindWindowA(None, title_pcstr).unwrap_or_default();
-        if hwnd.is_invalid() { return; }
-        
-        let progman = FindWindowA(s!("Progman"), None).unwrap_or_default();
-        if progman.is_invalid() { return; }
-
-        // Find the window directly above the desktop
-        let insert_after = GetWindow(progman, GW_HWNDPREV).unwrap_or_default();
-        let target = if insert_after.is_invalid() { HWND_TOP } else { insert_after };
-        
-        // Only re-position if we aren't already sitting exactly there (prevents flickering)
-        let current_above = GetWindow(hwnd, GW_HWNDPREV).unwrap_or_default();
-        if current_above != target {
-            let _ = SetWindowPos(hwnd, target, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-        }
-    }
-}
 // ═══════════════════════════════════════════════════════════════
 // Icon loader
 // ═══════════════════════════════════════════════════════════════
@@ -681,6 +631,7 @@ struct VisualizerApp {
     settings_open: Arc<AtomicBool>,
     config_gen: Arc<AtomicU64>,
     seen_gen: u64,
+    was_settings_open: bool,
     settings_icon: egui::IconData,
     ui_cmd_rx: crossbeam_channel::Receiver<UiCmd>,
 
@@ -688,8 +639,6 @@ struct VisualizerApp {
     _hotkey_manager: GlobalHotKeyManager,
 
     mesh: MeshBuilder,
-
-    desktop_attached: bool,
 }
 
 impl VisualizerApp {
@@ -816,12 +765,12 @@ impl VisualizerApp {
             settings_open,
             config_gen: Arc::new(AtomicU64::new(0)),
             seen_gen: 0,
+            was_settings_open: false,
             settings_icon: egui_icon,
             ui_cmd_rx,
             _tray_icon: tray_icon,
             _hotkey_manager: hotkey_manager,
             mesh: MeshBuilder::new(),
-            desktop_attached: false,
         }
     }
 
@@ -832,6 +781,138 @@ impl VisualizerApp {
         } else {
             base
         }
+    }
+
+    // ── Overlay geometry ──────────────────────────────────────
+
+    fn compute_overlay_rect(&self, ctx: &egui::Context, monitor: egui::Rect) -> egui::Rect {
+        let n_bars = self.visual_num_bars().max(1);
+        let stride = self.config.bar_width + self.config.bar_gap;
+        let bars_extent = (n_bars as f32 * stride - self.config.bar_gap).max(1.0);
+
+        let rect_len = match self.config.visualizer_direction {
+            VisualizerDirection::Up | VisualizerDirection::Down => {
+                monitor.height() * self.config.height_scale
+            }
+            VisualizerDirection::Left | VisualizerDirection::Right => {
+                monitor.width() * self.config.height_scale
+            }
+        };
+        let max_bar_h = if self.config.max_bar_height > 0.0 {
+            self.config.max_bar_height.min(rect_len)
+        } else {
+            rect_len
+        };
+
+        let cx = monitor.center().x + self.config.x_offset;
+        let cy = monitor.center().y + self.config.y_offset;
+
+        let bars_rect = match self.config.visualizer_direction {
+            VisualizerDirection::Up => egui::Rect::from_min_max(
+                egui::pos2(
+                    cx - bars_extent / 2.0,
+                    monitor.bottom() + self.config.y_offset - max_bar_h,
+                ),
+                egui::pos2(cx + bars_extent / 2.0, monitor.bottom() + self.config.y_offset),
+            ),
+            VisualizerDirection::Down => egui::Rect::from_min_max(
+                egui::pos2(cx - bars_extent / 2.0, monitor.top() + self.config.y_offset),
+                egui::pos2(cx + bars_extent / 2.0, monitor.top() + self.config.y_offset + max_bar_h),
+            ),
+            VisualizerDirection::Right => egui::Rect::from_min_max(
+                egui::pos2(monitor.left() + self.config.x_offset, cy - bars_extent / 2.0),
+                egui::pos2(
+                    monitor.left() + self.config.x_offset + max_bar_h,
+                    cy + bars_extent / 2.0,
+                ),
+            ),
+            VisualizerDirection::Left => egui::Rect::from_min_max(
+                egui::pos2(
+                    monitor.right() + self.config.x_offset - max_bar_h,
+                    cy - bars_extent / 2.0,
+                ),
+                egui::pos2(monitor.right() + self.config.x_offset, cy + bars_extent / 2.0),
+            ),
+        };
+
+        let mut bbox = bars_rect;
+
+        let cfg = &self.config.track_info;
+        let show_art = cfg.show_cover_art && self.cover_texture.is_some();
+        let has_track = self.track_info.is_some();
+        let show_text = has_track && (cfg.show_title || cfg.show_artist);
+
+        if has_track && (show_art || show_text) {
+            let margin = 40.0;
+            let art_size = if show_art { cfg.cover_size } else { 0.0 };
+            let art_x = monitor.right() - margin - art_size + cfg.cover_x_offset;
+            let art_y = monitor.top() + margin + cfg.cover_y_offset;
+
+            if show_art {
+                let art_rect = egui::Rect::from_min_size(
+                    egui::pos2(art_x, art_y),
+                    egui::vec2(art_size, art_size),
+                );
+                bbox = bbox.union(art_rect);
+            }
+
+            if show_text {
+                let text_x = monitor.right() - margin + cfg.text_x_offset;
+                let mut text_y = monitor.top() + margin + cfg.text_y_offset;
+                if show_art {
+                    text_y += art_size + 14.0;
+                }
+                
+                let info = self.track_info.as_ref().unwrap();
+                let family = if cfg.font_path.is_some() { custom_font_family() } else { egui::FontFamily::Proportional };
+                let artist_font = egui::FontId::new(cfg.artist_font_size, family.clone());
+                let title_font = egui::FontId::new(cfg.title_font_size, family);
+
+                // Accurately measure the text width so the bounding box is tight!
+                let artist_w = if cfg.show_artist && !info.artist.is_empty() {
+                    ctx.fonts(|f| f.layout_no_wrap(info.artist.clone(), artist_font.clone(), egui::Color32::WHITE).size().x)
+                } else { 0.0 };
+                let title_w = if cfg.show_title && !info.title.is_empty() {
+                    ctx.fonts(|f| f.layout_no_wrap(info.title.clone(), title_font, egui::Color32::WHITE).size().x)
+                } else { 0.0 };
+
+                let max_w = artist_w.max(title_w).max(50.0);
+                let est_h = (cfg.title_font_size + cfg.artist_font_size) * cfg.line_height.max(1.0) + 20.0;
+
+                let text_rect = match cfg.alignment {
+                    TrackTextAlign::Right => egui::Rect::from_min_max(
+                        egui::pos2(text_x - max_w, text_y),
+                        egui::pos2(text_x, text_y + est_h),
+                    ),
+                    TrackTextAlign::Left => egui::Rect::from_min_max(
+                        egui::pos2(text_x, text_y),
+                        egui::pos2(text_x + max_w, text_y + est_h),
+                    ),
+                    TrackTextAlign::Center => egui::Rect::from_min_max(
+                        egui::pos2(text_x - max_w / 2.0, text_y),
+                        egui::pos2(text_x + max_w / 2.0, text_y + est_h),
+                    ),
+                };
+                bbox = bbox.union(text_rect);
+            }
+        }
+
+        if self.config.show_fps {
+            let fps_rect = egui::Rect::from_min_size(
+                monitor.left_top() + egui::vec2(20.0, 20.0),
+                egui::vec2(160.0, 30.0),
+            );
+            bbox = bbox.union(fps_rect);
+        }
+
+        let pad = 32.0;
+        let bbox = bbox.expand(pad);
+
+        let min = egui::vec2(80.0, 60.0);
+        let size = bbox.size().max(min);
+        let center = bbox.center();
+        // Do NOT intersect with monitor here, otherwise things get clipped when Mirrored is wide.
+        egui::Rect::from_center_size(center, size)
     }
 
     // ── Palette updates ───────────────────────────────────────
@@ -1467,6 +1548,7 @@ impl VisualizerApp {
         &self,
         painter: &egui::Painter,
         ctx: &egui::Context,
+        overlay_origin: egui::Pos2,
         monitor: egui::Rect,
     ) {
         let Some(info) = &self.track_info else { return };
@@ -1494,13 +1576,14 @@ impl VisualizerApp {
             TrackTextAlign::Right => egui::Align2::RIGHT_TOP,
         };
         let cover_visible = cfg.show_cover_art && self.cover_texture.is_some();
+        let ov = overlay_origin.to_vec2();
 
-        let art_x = monitor.right() - margin - art_size + cfg.cover_x_offset;
-        let art_y = monitor.top() + margin + cfg.cover_y_offset;
+        let art_x_m = monitor.right() - margin - art_size + cfg.cover_x_offset;
+        let art_y_m = monitor.top() + margin + cfg.cover_y_offset;
         if cover_visible {
             if let Some(tex) = &self.cover_texture {
                 let art_rect = egui::Rect::from_min_size(
-                    egui::pos2(art_x, art_y),
+                    egui::pos2(art_x_m, art_y_m) - ov,
                     egui::vec2(art_size, art_size),
                 );
                 let tint = egui::Color32::from_white_alpha(cfg.cover_opacity);
@@ -1512,21 +1595,21 @@ impl VisualizerApp {
                 );
             }
         }
-        let mut text_y = monitor.top() + margin + cfg.text_y_offset;
+        let mut text_y_m = monitor.top() + margin + cfg.text_y_offset;
         if cover_visible {
-            text_y += art_size + text_gap;
+            text_y_m += art_size + text_gap;
         }
-        let text_x = monitor.right() - margin + cfg.text_x_offset;
-        let mut current_y = text_y;
+        let text_x_m = monitor.right() - margin + cfg.text_x_offset;
+        let mut current_y_m = text_y_m;
         if cfg.show_artist && !info.artist.is_empty() {
-            let pos = egui::pos2(text_x, current_y);
+            let pos = egui::pos2(text_x_m, current_y_m) - ov;
             self.draw_styled_text(
                 ctx, painter, &info.artist, pos, &artist_font, align, text_color, cfg,
             );
-            current_y += cfg.artist_font_size * cfg.line_height;
+            current_y_m += cfg.artist_font_size * cfg.line_height;
         }
         if cfg.show_title && !info.title.is_empty() {
-            let pos = egui::pos2(text_x, current_y);
+            let pos = egui::pos2(text_x_m, current_y_m) - ov;
             self.draw_styled_text(
                 ctx, painter, &info.title, pos, &title_font, align, text_color, cfg,
             );
@@ -1540,6 +1623,7 @@ impl VisualizerApp {
         painter: &egui::Painter,
         ctx: &egui::Context,
         monitor: egui::Rect,
+        overlay_origin: egui::Pos2,
     ) {
         let base_num_bars = self.current_bars.len();
         if base_num_bars == 0 {
@@ -1560,7 +1644,7 @@ impl VisualizerApp {
         let outline_on = self.config.visualizer_outline_enabled
             && self.config.visualizer_outline_thickness > 0.0;
 
-        let (rect_len, start_pos, anchor) = match dir {
+        let (rect_len, start_pos_m, anchor_m) = match dir {
             VisualizerDirection::Up => (
                 monitor.height() * self.config.height_scale,
                 monitor.center().x - total_size / 2.0 + self.config.x_offset,
@@ -1583,6 +1667,16 @@ impl VisualizerApp {
             ),
         };
 
+        let ov = overlay_origin.to_vec2();
+        let (start_pos, anchor) = match dir {
+            VisualizerDirection::Up | VisualizerDirection::Down => {
+                (start_pos_m - ov.x, anchor_m - ov.y)
+            }
+            VisualizerDirection::Left | VisualizerDirection::Right => {
+                (start_pos_m - ov.y, anchor_m - ov.x)
+            }
+        };
+
         let mut max_val = 0.0f32;
         for i in 0..base_num_bars {
             max_val = max_val.max(self.current_bars[i]);
@@ -1591,7 +1685,7 @@ impl VisualizerApp {
             .min(if max_h > 0.0 { max_h } else { rect_len })
             .max(1.0);
 
-        let gradient_rect = match dir {
+        let gradient_rect_m = match dir {
             VisualizerDirection::Up => egui::Rect::from_min_max(
                 egui::pos2(
                     monitor.center().x - total_size / 2.0 + self.config.x_offset,
@@ -1633,6 +1727,7 @@ impl VisualizerApp {
                 ),
             ),
         };
+        let gradient_rect = gradient_rect_m.translate(-ov);
 
         let is_static_multi_vertical = self.config.color_mode == ColorMode::StaticMultiple
             && self.config.static_mode == StaticDistributionMode::Vertical;
@@ -4023,6 +4118,87 @@ fn fft_size_combo(ui: &mut egui::Ui, a: &mut visualizer_core::config::AudioSetti
 }
 
 // ═══════════════════════════════════════════════════════════════
+// Settings viewport
+// ═══════════════════════════════════════════════════════════════
+
+fn run_settings_viewport(
+    ctx: &egui::Context,
+    shared: &Mutex<SettingsState>,
+    open: &AtomicBool,
+    generation: &AtomicU64,
+) {
+    let mut st = lock_state(shared);
+
+    if ctx.input(|i| i.viewport().close_requested()) {
+        st.config.save();
+        drop(st);
+        open.store(false, Ordering::Relaxed);
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
+        return;
+    }
+
+    if (st.config.settings_scale - st.old_settings_scale).abs() > 0.01 {
+        st.old_settings_scale = st.config.settings_scale;
+        let scale = st.config.settings_scale.clamp(0.75, 1.5);
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+            560.0 * scale,
+            720.0 * scale,
+        )));
+    }
+
+    egui::CentralPanel::default()
+        .frame(egui::Frame::none().fill(egui::Color32::BLACK))
+        .show(ctx, |ui| {
+            st.draw_settings_ui(ui);
+        });
+
+    if let Some(idx) = st.pending_audio_preset_delete {
+        egui::Window::new("Confirm Delete")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                let name = st
+                    .config
+                    .custom_audio_presets
+                    .get(idx)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default();
+                ui.label(format!("Delete preset '{}'?", name));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Yes").clicked() {
+                        if idx < st.config.custom_audio_presets.len() {
+                            st.config.custom_audio_presets.remove(idx);
+                        }
+                        st.pending_audio_preset_delete = None;
+                    }
+                    if ui.button("No").clicked() {
+                        st.pending_audio_preset_delete = None;
+                    }
+                });
+            });
+    }
+
+    let fp = config_fingerprint(&st.config);
+    let changed = st.audio_dirty || fp != st.last_fingerprint;
+    st.last_fingerprint = fp;
+
+    let wants_close = st.close_requested;
+    st.close_requested = false;
+    drop(st);
+
+    if changed {
+        generation.fetch_add(1, Ordering::Release);
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
+    }
+    if wants_close {
+        open.store(false, Ordering::Relaxed);
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
 // eframe::App
 // ═══════════════════════════════════════════════════════════════
 
@@ -4032,17 +4208,6 @@ impl eframe::App for VisualizerApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Attach to desktop once (Windows only)
-        #[cfg(target_os = "windows")]
-        if !self.desktop_attached {
-            unsafe {
-                if let Err(e) = desktop_integration::attach_to_desktop("Rust Visualizer") {
-                    eprintln!("Desktop attach failed: {e}");
-                }
-            }
-            self.desktop_attached = true;
-        }
-
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame_time).as_secs_f32();
         self.last_frame_time = now;
@@ -4093,6 +4258,9 @@ impl eframe::App for VisualizerApp {
             let mut st = lock_state(&self.shared);
             st.active_palettes = self.active_palettes.clone();
             drop(st);
+            if self.settings_open.load(Ordering::Relaxed) {
+                ctx.request_repaint_of(egui::ViewportId::from_hash_of("settings"));
+            }
         }
 
         if self.config.track_info.font_path != self.loaded_font_path {
@@ -4116,51 +4284,48 @@ impl eframe::App for VisualizerApp {
             self.last_bpm = frame.bpm;
         }
 
-                // Mouse passthrough: only when settings are closed
-        let settings_visible = self.settings_open.load(Ordering::Relaxed);
-        let want_passthrough = !settings_visible;
-        if want_passthrough != self.is_passthrough_set {
-            ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(want_passthrough));
-            self.is_passthrough_set = want_passthrough;
+        if !self.is_passthrough_set {
+            ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
+            self.is_passthrough_set = true;
         }
 
-        // Enforce Z-order every frame so winit can't accidentally bring us above other apps
-        #[cfg(target_os = "windows")]
-        unsafe {
-            desktop_integration::enforce_z_order("Rust Visualizer");
-        }
-
-        // The main window is now full-monitor and parented to the desktop.
+        // Get the accurate monitor size directly from the viewport info
         let monitor_size = ctx.input(|i| i.viewport().monitor_size).unwrap_or(egui::vec2(1920.0, 1080.0));
         let monitor = egui::Rect::from_min_size(egui::Pos2::ZERO, monitor_size);
 
-        // Ensure the window covers the whole monitor
+        let target = self.compute_overlay_rect(ctx, monitor);
+
+        let actual_pos = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min)).unwrap_or(egui::Pos2::ZERO);
         let actual_size = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size())).unwrap_or(egui::Vec2::ZERO);
-        if (actual_size - monitor_size).length() > 1.0 {
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(monitor_size));
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(0.0, 0.0)));
+
+        // Send commands if the actual window differs from the target.
+        if (actual_size - target.size()).length() > 1.0 || (actual_pos - target.min).length() > 1.0 {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target.size()));
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target.min));
         }
 
+        let local_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, target.size());
+        let overlay_origin = target.min;
         let painter = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Background,
             egui::Id::new("overlay"),
         ));
 
-        // Background
         if self.config.bg_opacity > 0 {
             let c = self.config.bg_color;
             let bg_color =
                 egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], self.config.bg_opacity);
-            painter.rect_filled(monitor, 0.0, bg_color);
+            painter.rect_filled(local_rect, 0.0, bg_color);
         }
 
-        self.draw_bars(&painter, ctx, monitor);
-        self.draw_track_info(&painter, ctx, monitor);
+        self.draw_bars(&painter, ctx, monitor, overlay_origin);
+        self.draw_track_info(&painter, ctx, overlay_origin, monitor);
 
         if self.config.show_fps {
-            let pos = monitor.left_top() + egui::vec2(20.0, 20.0);
+            let world_pos = monitor.left_top() + egui::vec2(20.0, 20.0);
+            let local_pos = world_pos - overlay_origin.to_vec2();
             painter.text(
-                pos,
+                local_pos,
                 egui::Align2::LEFT_TOP,
                 format!("FPS: {:.1}", self.current_fps),
                 egui::FontId::monospace(16.0),
@@ -4168,43 +4333,35 @@ impl eframe::App for VisualizerApp {
             );
         }
 
-        // Settings overlay (same window)
-        if settings_visible {
-            let mut st = lock_state(&self.shared);
-            st.last_bpm = self.last_bpm;
-            st.current_fps = self.current_fps;
-
-            let scale = st.config.settings_scale.clamp(0.75, 1.5);
-            let default_size = egui::vec2(560.0 * scale, 720.0 * scale);
-            let screen_rect = ctx.screen_rect();
-            let window_pos = screen_rect.center() - default_size / 2.0;
-
-            let mut is_open = true;
-            egui::Window::new("Settings")
-                .open(&mut is_open)
-                .resizable(true)
-                .default_size(default_size)
-                .default_pos(window_pos)
-                .collapsible(false)
-                .show(ctx, |ui| {
-                    st.draw_settings_ui(ui);
-                });
-
-           if !is_open || st.close_requested {
-                st.close_requested = false;
-                drop(st);
-                self.settings_open.store(false, Ordering::Relaxed);
-                // Let the top of the update loop handle passthrough restoration on the next frame
-            } else {
-                let fp = config_fingerprint(&st.config);
-                let changed = st.audio_dirty || fp != st.last_fingerprint;
-                st.last_fingerprint = fp;
-                if changed {
-                    st.config.save();
-                    self.config_gen.fetch_add(1, Ordering::Release);
-                }
+        let open = self.settings_open.load(Ordering::Relaxed);
+        let settings_id = egui::ViewportId::from_hash_of("settings");
+        if open {
+            let scale = self.config.settings_scale.clamp(0.75, 1.5);
+            let mut builder = egui::ViewportBuilder::default()
+                .with_title("Rust Visualizer — Settings")
+                .with_inner_size([560.0 * scale, 720.0 * scale])
+                .with_decorations(true)
+                .with_resizable(true)
+                .with_always_on_top();
+            if self.settings_icon.width > 0 {
+                builder = builder.with_icon(self.settings_icon.clone());
             }
+
+            if let Ok(mut st) = self.shared.try_lock() {
+                st.last_bpm = self.last_bpm;
+                st.current_fps = self.current_fps;
+            }
+
+            let shared = self.shared.clone();
+            let open_flag = self.settings_open.clone();
+            let generation = self.config_gen.clone();
+            ctx.show_viewport_deferred(settings_id, builder, move |ctx, _class| {
+                run_settings_viewport(ctx, &shared, &open_flag, &generation);
+            });
+        } else if self.was_settings_open {
+            ctx.send_viewport_cmd_to(settings_id, egui::ViewportCommand::Close);
         }
+        self.was_settings_open = open;
 
         let moving = self.current_bars.iter().any(|&v| v > 0.0005)
             || self.current_peaks.iter().any(|&v| v > 0.0005)
@@ -4226,16 +4383,14 @@ impl eframe::App for VisualizerApp {
 fn main() -> eframe::Result<()> {
     let (egui_icon, _) = load_icon();
 
-        let options = eframe::NativeOptions {
+    let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_transparent(true)
             .with_decorations(false)
-            // NOT calling .with_always_on_top() — default is already false.
-            // We control z-order manually via Win32 after the window is created.
-            .with_inner_size([1920.0, 1080.0])
+            .with_always_on_top()
+            .with_inner_size([1280.0, 720.0])
             .with_position([0.0, 0.0])
-            .with_icon(egui_icon)
-            .with_title("Rust Visualizer"),
+            .with_icon(egui_icon),
         vsync: true,
         ..Default::default()
     };
