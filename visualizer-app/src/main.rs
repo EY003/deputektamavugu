@@ -36,13 +36,12 @@ use tray_icon::{
 mod desktop_integration {
     use std::ffi::CString;
     use windows::Win32::UI::WindowsAndMessaging::{
-        FindWindowA, GetWindowLongW, SetWindowLongW, SetWindowPos, GetWindow,
+        FindWindowA, GetWindowLongW, SetWindowLongW, SetWindowPos, GetWindow, SetForegroundWindow,
         GWL_EXSTYLE, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_FRAMECHANGED,
-        WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_EX_NOACTIVATE, GW_HWNDPREV,
+        WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_EX_NOACTIVATE, GW_HWNDPREV, WS_EX_TRANSPARENT,
     };
     use windows::core::{s, PCSTR};
 
-    /// Place the window in the Z-order right above the desktop icons, but below normal apps.
     pub unsafe fn attach_to_desktop(window_title: &str) -> Result<(), String> {
         let title_cstr = CString::new(window_title).map_err(|e| e.to_string())?;
         let title_pcstr = PCSTR::from_raw(title_cstr.as_ptr() as *const u8);
@@ -52,32 +51,56 @@ mod desktop_integration {
             return Err("target window handle is null".into());
         }
 
-        // 1. Remove from Alt+Tab and prevent stealing focus when clicked.
-        // We keep WS_EX_LAYERED out of here because eframe handles its own transparency natively.
+        // Remove APPWINDOW and add TOOLWINDOW. We do NOT touch NOACTIVATE or LAYERED here.
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
-        let new_ex_style = (ex_style & !WS_EX_APPWINDOW.0) | WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0;
+        let new_ex_style = (ex_style & !WS_EX_APPWINDOW.0) | WS_EX_TOOLWINDOW.0;
         SetWindowLongW(hwnd, GWL_EXSTYLE, new_ex_style as i32);
 
-        // 2. Find the desktop window (Progman)
         let progman = FindWindowA(s!("Progman"), None).unwrap_or_default();
         
         if !progman.is_invalid() {
-            // Find the window that is currently directly ABOVE the desktop, and place ourselves there.
             let mut insert_after = GetWindow(progman, GW_HWNDPREV).unwrap_or_default();
             if insert_after.is_invalid() {
                 insert_after = HWND_TOP;
             }
             
-            SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, 
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED)
-                .map_err(|e| format!("SetWindowPos: {e}"))?;
+            let _ = SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, 
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
         } else {
-            // Fallback if Progman isn't found
-            SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, 
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED)
-                .map_err(|e| format!("SetWindowPos: {e}"))?;
+            let _ = SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, 
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
         }
 
+        Ok(())
+    }
+
+    pub unsafe fn set_interactive(window_title: &str, interactive: bool) -> Result<(), String> {
+        let title_cstr = CString::new(window_title).map_err(|e| e.to_string())?;
+        let title_pcstr = PCSTR::from_raw(title_cstr.as_ptr() as *const u8);
+        let hwnd = FindWindowA(None, title_pcstr).map_err(|e| format!("FindWindowA: {e}"))?;
+        
+        if hwnd.is_invalid() {
+            return Err("Window handle is null".into());
+        }
+
+        let mut ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+        
+        if interactive {
+            // Settings open: allow clicks and focus
+            ex_style &= !WS_EX_TRANSPARENT.0;
+            ex_style &= !WS_EX_NOACTIVATE.0;
+        } else {
+            // Settings closed: click-through and no focus
+            ex_style |= WS_EX_TRANSPARENT.0;
+            ex_style |= WS_EX_NOACTIVATE.0;
+        }
+        
+        SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style as i32);
+        
+        if interactive {
+            let _ = SetForegroundWindow(hwnd);
+        }
+        
         Ok(())
     }
 }
@@ -4120,7 +4143,10 @@ impl eframe::App for VisualizerApp {
         let settings_visible = self.settings_open.load(Ordering::Relaxed);
         let want_passthrough = !settings_visible;
         if want_passthrough != self.is_passthrough_set {
-            ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(want_passthrough));
+            #[cfg(target_os = "windows")]
+            unsafe {
+                let _ = desktop_integration::set_interactive("Rust Visualizer", !want_passthrough);
+            }
             self.is_passthrough_set = want_passthrough;
         }
 
@@ -4184,12 +4210,11 @@ impl eframe::App for VisualizerApp {
                     st.draw_settings_ui(ui);
                 });
 
-            if !is_open || st.close_requested {
+           if !is_open || st.close_requested {
                 st.close_requested = false;
                 drop(st);
                 self.settings_open.store(false, Ordering::Relaxed);
-                ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
-                self.is_passthrough_set = true;
+                // Let the top of the update loop handle passthrough restoration on the next frame
             } else {
                 let fp = config_fingerprint(&st.config);
                 let changed = st.audio_dirty || fp != st.last_fingerprint;
