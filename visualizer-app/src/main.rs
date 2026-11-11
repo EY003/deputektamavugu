@@ -35,14 +35,15 @@ use tray_icon::{
 #[cfg(target_os = "windows")]
 mod desktop_integration {
     use std::ffi::CString;
+    use windows::Win32::Foundation::{HWND, BOOL, LPARAM, WPARAM, COLORREF};
     use windows::Win32::UI::WindowsAndMessaging::{
         FindWindowA, FindWindowExA, GetWindowLongW, SetParent, SetWindowLongW, SetWindowPos,
-        SetLayeredWindowAttributes, EnumWindows,
+        SetLayeredWindowAttributes, EnumWindows, SendMessageTimeoutA, SetClassLongPtrW,
         GWL_EXSTYLE, GWL_STYLE, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_FRAMECHANGED,
         WS_CHILD, WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPED, WS_POPUP,
-        SetClassLongPtrW, GCLP_HBRBACKGROUND, LWA_ALPHA,
+        GCLP_HBRBACKGROUND, LWA_ALPHA, SMTO_NORMAL,
     };
-    use windows::core::{s, PCSTR, BOOL, LPARAM, WPARAM};
+    use windows::core::{s, PCSTR};
 
     // Helper to find the WorkerW window that hosts the wallpaper
     unsafe extern "system" fn enum_window(window: HWND, ref_worker_w: LPARAM) -> BOOL {
@@ -70,21 +71,20 @@ mod desktop_integration {
 
         let hwnd = FindWindowA(None, title_pcstr)
             .map_err(|e| format!("FindWindowA(target): {e}"))?;
-        if hwnd.0.is_null() {
+        if hwnd.is_invalid() {
             return Err("target window handle is null".into());
         }
 
         // 1. Find the top-level Progman window
         let progman = FindWindowA(s!("Progman"), None)
             .map_err(|e| format!("FindWindowA(Progman): {e}"))?;
-        if progman.0.is_null() {
+        if progman.is_invalid() {
             return Err("Progman handle is null".into());
         }
 
         // 2. Send the magic message to Progman to spawn the WorkerW if needed
-        // This message is 0x052C, a known undocumented trick.
-        use windows::Win32::UI::WindowsAndMessaging::{SendMessageTimeoutA, SMTO_NORMAL};
-        SendMessageTimeoutA(progman, 0x052C, WPARAM(0), LPARAM(0), SMTO_NORMAL, 1000, None);
+        // The return value is a usize (handle to result), we can ignore it safely.
+        let _ = SendMessageTimeoutA(progman, 0x052C, WPARAM(0), LPARAM(0), SMTO_NORMAL, 1000, None);
 
         // 3. Enumerate windows to find the correct WorkerW sibling
         let mut worker_w = HWND::default();
@@ -116,7 +116,7 @@ mod desktop_integration {
         SetParent(hwnd, worker_w).map_err(|e| format!("SetParent: {e}"))?;
 
         // 6. Explicitly set transparency attributes
-        // LWA_ALPHA with an opacity of 255 tells the DWM to respect the window's own alpha channel.
+        // LWA_ALPHA with 255 tells the DWM to respect the window's per-pixel alpha channel.
         SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA)
             .map_err(|e| format!("SetLayeredWindowAttributes: {e}"))?;
 
@@ -128,7 +128,6 @@ mod desktop_integration {
         Ok(())
     }
 }
-
 // ═══════════════════════════════════════════════════════════════
 // Icon loader
 // ═══════════════════════════════════════════════════════════════
