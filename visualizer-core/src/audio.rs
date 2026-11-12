@@ -14,6 +14,13 @@ use crate::config::{
     WeightingCurve, WindowFunction,
 };
 
+const MIN_BEAT_GAP_S: f64 = 0.25;   // max 240 BPM raw trigger rate
+const BPM_FOLD_MIN: f64 = 70.0;
+const BPM_FOLD_MAX: f64 = 180.0;
+const BEAT_MEMORY_S: f64 = 8.0;     // forget beats older than this
+const BEAT_TIMEOUT_S: f64 = 5.0;    // no beat for this long => BPM = 0
+const MAX_BEATS: usize = 12;
+
 // ─────────────────────────────────────────────────────────────
 // Public API
 // ─────────────────────────────────────────────────────────────
@@ -176,7 +183,8 @@ fn capture_loop(
                 }
             }
             if mono.is_empty() { continue; }
-            if sample_tx.send(mono.clone()).is_err() { return; }
+            let out = std::mem::replace(&mut mono, Vec::with_capacity(4096));
+            if sample_tx.send(out).is_err() { return; }
         }
     }
 }
@@ -354,6 +362,13 @@ struct AudioProcessor {
     phase: f32,
     beat_envelope: f32,
     time_elapsed: f64,
+
+    // Patch 6: edge-detection and cached per-bar dB offsets.
+    beat_armed: bool,
+    bar_offset_db: Vec<f32>,
+    offset_centers: Vec<f32>,
+    offset_params: [f32; 4],
+    offset_weighting: u8,
 }
 
 impl AudioProcessor {
@@ -409,6 +424,50 @@ impl AudioProcessor {
             phase: 0.0,
             beat_envelope: 0.0,
             time_elapsed: 0.0,
+            beat_armed: true,
+            bar_offset_db: Vec::new(),
+            offset_centers: Vec::new(),
+            offset_params: [f32::NAN; 4], // NaN never equals => forces first build
+            offset_weighting: u8::MAX,
+        }
+    }
+
+    /// tilt + EQ + weighting depend only on settings and the bar's centre
+    /// frequency, so compute them when those change, not every frame.
+    fn refresh_bar_offsets(&mut self, s: &AudioSettings) {
+        let w_id = match s.weighting {
+            WeightingCurve::None => 0u8,
+            WeightingCurve::AWeighting => 1,
+            WeightingCurve::KWeighting => 2,
+        };
+        let params = [s.spectrum_tilt, s.eq_bass_db, s.eq_mid_db, s.eq_treble_db];
+        if self.offset_params == params
+            && self.offset_weighting == w_id
+            && self.offset_centers == self.bin_centers_hz
+        {
+            return;
+        }
+        self.offset_params = params;
+        self.offset_weighting = w_id;
+        self.offset_centers.clear();
+        self.offset_centers.extend_from_slice(&self.bin_centers_hz);
+
+        self.bar_offset_db.clear();
+        for &f in &self.bin_centers_hz {
+            let tilt_db = s.spectrum_tilt * (f / 1000.0).log2();
+            let eq_db = if f < 250.0 {
+                s.eq_bass_db
+            } else if f < 4000.0 {
+                s.eq_mid_db
+            } else {
+                s.eq_treble_db
+            };
+            let weight_db = match s.weighting {
+                WeightingCurve::None => 0.0,
+                WeightingCurve::AWeighting => a_weighting_db(f),
+                WeightingCurve::KWeighting => k_weighting_db(f),
+            };
+            self.bar_offset_db.push(tilt_db + eq_db + weight_db);
         }
     }
 
@@ -462,6 +521,10 @@ impl AudioProcessor {
         self.beat_energy_history.clear();
         self.beat_energy_sum = 0.0;
         self.beat_envelope = 0.0;
+        // New silence => the next track starts from scratch.
+        self.beat_times.clear();
+        self.beat_armed = true;
+        self.bpm = 0.0;
     }
 
     fn silent_frame(&self) -> BarFrame {
@@ -584,6 +647,7 @@ impl AudioProcessor {
         }
 
         // ── dB mapping (reuse mapped) ────────────────────────────
+        self.refresh_bar_offsets(s);
         let sens_norm = (s.sensitivity / 100.0).clamp(0.0, 1.0);
         let min_db_effective = s.min_decibels - (sens_norm - 0.5) * 20.0;
         let db_span = (s.max_decibels - min_db_effective).max(1.0);
@@ -592,28 +656,8 @@ impl AudioProcessor {
 
         for i in 0..num_bars {
             let db = 20.0 * self.raw_bars[i].log10();
-            let center_freq = self.bin_centers_hz.get(i).copied().unwrap_or(1000.0);
-
-            let octaves_from_1k = (center_freq / 1000.0).log2();
-            let tilt_db = s.spectrum_tilt * octaves_from_1k;
-
-            let eq_db = if center_freq < 250.0 {
-                s.eq_bass_db
-            } else if center_freq < 4000.0 {
-                s.eq_mid_db
-            } else {
-                s.eq_treble_db
-            };
-
-            let weight_db = match s.weighting {
-                WeightingCurve::None => 0.0,
-                WeightingCurve::AWeighting => a_weighting_db(center_freq),
-                WeightingCurve::KWeighting => k_weighting_db(center_freq),
-            };
-
-            let tilted_db = db + tilt_db + eq_db + weight_db;
+            let tilted_db = db + self.bar_offset_db.get(i).copied().unwrap_or(0.0);
             let mut n01 = ((tilted_db - min_db_effective) / db_span).clamp(0.0, 1.0);
-
             if n01 < s.noise_gate {
                 n01 = 0.0;
             }
@@ -621,45 +665,45 @@ impl AudioProcessor {
         }
 
         // ── time-domain smoothing using a flat ring buffer ───────
-let avg = s.average_size.max(1);
-let needed = avg * num_bars;
-if self.frame_ring.len() != needed {
-    self.frame_ring.resize(needed, 0.0);
-    self.frame_ring_pos = 0;
-    self.frame_ring_count = 0;
-}
-if self.frame_ring_count < avg {
-    self.frame_ring_count += 1;
-}
-let base = self.frame_ring_pos * num_bars;
-self.frame_ring[base..base + num_bars].copy_from_slice(&self.mapped);
-self.frame_ring_pos = (self.frame_ring_pos + 1) % avg;
+        let avg = s.average_size.max(1);
+        let needed = avg * num_bars;
+        if self.frame_ring.len() != needed {
+            self.frame_ring.resize(needed, 0.0);
+            self.frame_ring_pos = 0;
+            self.frame_ring_count = 0;
+        }
+        if self.frame_ring_count < avg {
+            self.frame_ring_count += 1;
+        }
+        let base = self.frame_ring_pos * num_bars;
+        self.frame_ring[base..base + num_bars].copy_from_slice(&self.mapped);
+        self.frame_ring_pos = (self.frame_ring_pos + 1) % avg;
 
-// Sum all frames in the ring (reuse `smoothed` as accumulator).
-self.smoothed.fill(0.0);
-for f in 0..self.frame_ring_count {
-    let offset = f * num_bars;
-    for i in 0..num_bars {
-        self.smoothed[i] += self.frame_ring[offset + i];
-    }
-}
-let inv = 1.0 / self.frame_ring_count as f32;
-for v in self.smoothed.iter_mut() { *v *= inv; }
+        // Sum all frames in the ring (reuse `smoothed` as accumulator).
+        self.smoothed.fill(0.0);
+        for f in 0..self.frame_ring_count {
+            let offset = f * num_bars;
+            for i in 0..num_bars {
+                self.smoothed[i] += self.frame_ring[offset + i];
+            }
+        }
+        let inv = 1.0 / self.frame_ring_count as f32;
+        for v in self.smoothed.iter_mut() { *v *= inv; }
 
-// ── per-frame peak normalization ──────────────────────────
-if s.per_frame_normalization {
-    let peak = self.smoothed.iter().cloned().fold(0.0f32, f32::max);
-    if peak > 0.001 {
-        for v in self.smoothed.iter_mut() { *v /= peak; }
-    }
-}
+        // ── per-frame peak normalization ──────────────────────────
+        if s.per_frame_normalization {
+            let peak = self.smoothed.iter().cloned().fold(0.0f32, f32::max);
+            if peak > 0.001 {
+                for v in self.smoothed.iter_mut() { *v /= peak; }
+            }
+        }
 
-// ── FIXED: move `smoothed` out to avoid the double-borrow ─
-let smoothed = std::mem::take(&mut self.smoothed);
-self.update_ballistics(&smoothed, s, dt);
-self.smoothed = smoothed;
+        // ── FIXED: move `smoothed` out to avoid the double-borrow ─
+        let smoothed = std::mem::take(&mut self.smoothed);
+        self.update_ballistics(&smoothed, s, dt);
+        self.smoothed = smoothed;
 
-let (beat, phase) = self.detect_rhythm(s, dt);
+        let (beat, phase) = self.detect_rhythm(s, dt);
 
         Some(BarFrame {
             values: self.bar_values.clone(),
@@ -738,48 +782,66 @@ let (beat, phase) = self.detect_rhythm(s, dt);
         let nyquist = n_fft / 2;
         let bin_width = self.sample_rate / n_fft as f32;
 
-        let mut bass_energy = 0.0;
-        let mut mid_energy = 0.0;
-        let mut treble_energy = 0.0;
-        for bin in 1..nyquist {
-            let f = bin as f32 * bin_width;
-            let mag = self.output_buffer[bin].norm();
-            if f < 250.0 { bass_energy += mag; }
-            else if f < 4000.0 { mid_energy += mag; }
-            else { treble_energy += mag; }
-        }
-        let energy = match s.beat_focus {
-            BeatFocusMode::Bass => bass_energy,
-            BeatFocusMode::Mid => mid_energy,
-            BeatFocusMode::Treble => treble_energy,
+        // Band edges as bin indices (bass < 250 Hz <= mid < 4 kHz <= treble).
+        let bass_end = ((250.0 / bin_width).ceil() as usize).clamp(1, nyquist);
+        let mid_end = ((4000.0 / bin_width).ceil() as usize).clamp(bass_end, nyquist);
+        let (lo, hi) = match s.beat_focus {
+            BeatFocusMode::Bass => (1, bass_end),
+            BeatFocusMode::Mid => (bass_end, mid_end),
+            BeatFocusMode::Treble => (mid_end, nyquist),
         };
+        // Only the focused band is summed (was: the whole spectrum, every frame).
+        let energy: f32 = self.output_buffer[lo..hi.max(lo)].iter().map(|c| c.norm()).sum();
 
+        // ~1.5 s sliding window of band energy.
         let hist_len = (s.poll_rate_hz * 1.5).max(30.0) as usize;
-        // Maintain a running sum: subtract oldest when popping.
-        if self.beat_energy_history.len() >= hist_len {
-            if let Some(old) = self.beat_energy_history.pop_front() {
-                self.beat_energy_sum -= old;
-            }
+        while self.beat_energy_history.len() >= hist_len {
+            self.beat_energy_history.pop_front();
         }
         self.beat_energy_history.push_back(energy);
-        self.beat_energy_sum += energy;
-
-        let local_avg = if self.beat_energy_history.is_empty() {
-            energy
-        } else {
-            self.beat_energy_sum / self.beat_energy_history.len() as f32
-        };
+        // Exact sum (<= a few hundred entries): no f32 drift like a running sum.
+        self.beat_energy_sum = self.beat_energy_history.iter().sum();
+        let local_avg = self.beat_energy_sum / self.beat_energy_history.len() as f32;
 
         let sensitivity = s.beat_detection_sensitivity.clamp(0.0, 1.0);
-        let threshold = local_avg * s.energy_threshold_multiplier.max(1.0) * (1.0 - sensitivity * 0.5);
-        let is_beat = energy > threshold
-            && energy > local_avg * 1.05
-            && self.time_elapsed - self.beat_times.back().copied().unwrap_or(0.0) > 0.15;
+        let threshold =
+            local_avg * s.energy_threshold_multiplier.max(1.0) * (1.0 - sensitivity * 0.5);
+        let above = energy > threshold && energy > local_avg * 1.05;
+
+        // Hysteresis: re-arm only after the energy has dropped back down.
+        if energy < threshold * 0.9 {
+            self.beat_armed = true;
+        }
+        let since_last = self.time_elapsed
+            - self.beat_times.back().copied().unwrap_or(f64::NEG_INFINITY);
+        let is_beat = above && self.beat_armed && since_last > MIN_BEAT_GAP_S;
+        if above {
+            // Consume the crossing, even if the lockout rejected it,
+            // so a sustained loud passage can't re-trigger later.
+            self.beat_armed = false;
+        }
 
         if is_beat {
             self.beat_times.push_back(self.time_elapsed);
-            while self.beat_times.len() > 8 { self.beat_times.pop_front(); }
+            while self.beat_times.len() > MAX_BEATS {
+                self.beat_times.pop_front();
+            }
             self.recompute_bpm();
+        }
+
+        // Expire stale beats / stale tempo.
+        while let Some(&t) = self.beat_times.front() {
+            if self.time_elapsed - t > BEAT_MEMORY_S {
+                self.beat_times.pop_front();
+            } else {
+                break;
+            }
+        }
+        if let Some(&last) = self.beat_times.back() {
+            if self.time_elapsed - last > BEAT_TIMEOUT_S {
+                self.beat_times.clear();
+                self.bpm = 0.0;
+            }
         }
 
         if is_beat {
@@ -787,12 +849,13 @@ let (beat, phase) = self.detect_rhythm(s, dt);
         } else if self.beat_envelope > 0.0 {
             let tau = (s.beat_envelope_decay_ms / 1000.0).max(0.001);
             self.beat_envelope *= (-dt / tau).exp();
-            if self.beat_envelope < 0.001 { self.beat_envelope = 0.0; }
+            if self.beat_envelope < 0.001 {
+                self.beat_envelope = 0.0;
+            }
         }
 
         let period_s = if self.bpm > 20.0 { 60.0 / self.bpm } else { 0.5 };
-        self.phase += dt / period_s;
-        if self.phase >= 1.0 { self.phase -= 1.0; }
+        self.phase = (self.phase + dt / period_s).rem_euclid(1.0);
 
         if is_beat && s.bpm_lock_enabled {
             let gain = s.bpm_phase_smoothing.clamp(0.0, 1.0);
@@ -804,13 +867,48 @@ let (beat, phase) = self.detect_rhythm(s, dt);
     }
 
     fn recompute_bpm(&mut self) {
-        if self.beat_times.len() < 2 { self.bpm = 0.0; return; }
-        let mut intervals: Vec<f64> = self.beat_times.iter()
+        // Need at least 2 intervals (3 beats) before trusting anything.
+        if self.beat_times.len() < 3 {
+            return;
+        }
+        let min_iv = 60.0 / BPM_FOLD_MAX;
+        let max_iv = 60.0 / BPM_FOLD_MIN;
+
+        // Fold every interval into [min_iv, max_iv]: a missed beat (2x) or a
+        // double trigger (0.5x) then votes for the same tempo as a normal one.
+        let mut iv: Vec<f64> = self
+            .beat_times
+            .iter()
             .zip(self.beat_times.iter().skip(1))
-            .map(|(a, b)| b - a).collect();
-        intervals.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let median = intervals[intervals.len() / 2];
-        if median > 0.001 { self.bpm = (60.0 / median) as f32; }
+            .map(|(a, b)| b - a)
+            .filter(|d| *d > 0.05)
+            .map(|mut d| {
+                while d < min_iv { d *= 2.0; }
+                while d > max_iv { d *= 0.5; }
+                d
+            })
+            .collect();
+        if iv.len() < 2 {
+            return;
+        }
+        iv.sort_by(|a, b| a.total_cmp(b));
+        let median = iv[iv.len() / 2];
+
+        // Average only the intervals that agree with the median (reject outliers).
+        let (sum, n) = iv
+            .iter()
+            .filter(|d| (**d - median).abs() <= median * 0.12)
+            .fold((0.0f64, 0usize), |(s, n), d| (s + d, n + 1));
+        if n == 0 {
+            return;
+        }
+        let new_bpm = (60.0 / (sum / n as f64)) as f32;
+
+        if self.bpm <= 0.0 || (new_bpm - self.bpm).abs() / self.bpm > 0.12 {
+            self.bpm = new_bpm; // first estimate or genuine tempo change: jump
+        } else {
+            self.bpm += (new_bpm - self.bpm) * 0.3; // otherwise smooth the jitter
+        }
     }
 }
 
