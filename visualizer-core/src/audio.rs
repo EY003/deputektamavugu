@@ -269,12 +269,12 @@ fn capture_session(
             };
             if frames_read == 0 { break; }
 
-            if flags.is_data_discontinuity() {
-                let _ = ctrl_tx.try_send(ControlMsg::ResetDcBlocker);
-            }
-            if flags.is_silent() {
-               sample_buffer[..needed].fill(0.0);
-            }
+            if flags.data_discontinuity {
+    let _ = ctrl_tx.try_send(ControlMsg::ResetDcBlocker);
+}
+if flags.silent {
+    sample_buffer[..needed].fill(0.0);
+}
 
             let valid_samples = (frames_read as usize * samples_per_frame).min(sample_buffer.len());
             let samples = &sample_buffer[..valid_samples];
