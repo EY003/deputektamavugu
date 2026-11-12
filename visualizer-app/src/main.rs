@@ -334,14 +334,15 @@ impl PaletteWorker {
         let _ = std::thread::Builder::new()
             .name("palette-worker".into())
             .spawn(move || {
-                while let Ok(first) = job_rx.recv() {
-                    // Coalesce: while sliders are dragged only the newest job per slot matters.
-                    let mut latest: [Option<PaletteJob>; 4] = Default::default();
-                    latest[first.key.slot as usize] = Some(first);
-                    while let Ok(j) = job_rx.try_recv() {
-                        let s = j.key.slot as usize;
-                        latest[s] = Some(j);
-                    }
+               while let Ok(first) = job_rx.recv() {
+    // Coalesce: while sliders are dragged only the newest job per slot matters.
+    let mut latest: [Option<PaletteJob>; 4] = Default::default();
+    let slot = first.key.slot as usize;        // ← added
+    latest[slot] = Some(first);                // ← changed
+    while let Ok(j) = job_rx.try_recv() {
+        let s = j.key.slot as usize;
+        latest[s] = Some(j);                   // ← already fine (s is a plain usize)
+    }
                     for job in latest.into_iter().flatten() {
                         let colors = color::extract_palette(
                             &job.image,
