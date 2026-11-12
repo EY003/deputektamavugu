@@ -571,6 +571,8 @@ const SEARCH_INDEX: &[(SettingsTab, &str, &[&str])] = &[
 struct MeshBuilder {
     vertices: Vec<egui::epaint::Vertex>,
     indices: Vec<u32>,
+    last_v: usize,
+    last_i: usize,
 }
 
 impl MeshBuilder {
@@ -578,12 +580,18 @@ impl MeshBuilder {
         Self {
             vertices: Vec::with_capacity(8192),
             indices: Vec::with_capacity(12288),
+            last_v: 8192,
+            last_i: 12288,
         }
     }
 
+    /// Start a new frame. `take_mesh` moved the buffers out, so re-reserve
+    /// based on last frame's size (+12 % headroom) to avoid regrowth.
     fn reset(&mut self) {
         self.vertices.clear();
         self.indices.clear();
+        self.vertices.reserve(self.last_v + self.last_v / 8);
+        self.indices.reserve(self.last_i + self.last_i / 8);
     }
 
     fn push_quad(
@@ -616,10 +624,13 @@ impl MeshBuilder {
         self.indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
 
-    fn take_mesh(&self) -> egui::Mesh {
+    /// Moves the buffers into an `egui::Mesh` (no copy).
+    fn take_mesh(&mut self) -> egui::Mesh {
+        self.last_v = self.vertices.len();
+        self.last_i = self.indices.len();
         egui::Mesh {
-            indices: self.indices.clone(),
-            vertices: self.vertices.clone(),
+            indices: std::mem::take(&mut self.indices),
+            vertices: std::mem::take(&mut self.vertices),
             texture_id: egui::TextureId::default(),
         }
     }
