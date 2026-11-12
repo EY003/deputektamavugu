@@ -25,8 +25,11 @@ pub const DEFAULT_COVER_SIZE:       f32 = 190.0;
 pub const DEFAULT_FFT_SIZE:                usize = 2048;
 pub const DEFAULT_MIN_FREQ:                f32   = 30.0;
 pub const DEFAULT_MAX_FREQ:                f32   = 16_000.0;
-pub const DEFAULT_MIN_DB:                  f32   = -85.0;
-pub const DEFAULT_MAX_DB:                  f32   = -20.0;
+// Shifted −6 dB from the pre-window-gain-compensation values (−85/−20) so
+// the same input signal still maps to the same bar height after the audio
+// core was corrected to apply proper window gain (Hann ≈ +6.02 dB).
+pub const DEFAULT_MIN_DB:                  f32   = -91.0;
+pub const DEFAULT_MAX_DB:                  f32   = -26.0;
 pub const DEFAULT_TARGET_RANGE:            f32   = 60.0;
 pub const DEFAULT_SENSITIVITY:             f32   = 50.0;
 pub const DEFAULT_RAW_GAIN:                f32   = 1.0;
@@ -674,6 +677,21 @@ pub enum AudioPreset {
     LoFi, Metal, Country, RnB, Vocal, Podcast,
 }
 
+/// Audio-core v1 gain compensation adds back the coherent gain that the old
+/// rectangular-assumed normalization was throwing away. These are how much
+/// louder (in dB) a fixed input signal now reads than it did before, per
+/// window. Used both to seed the built-in presets and to migrate saved
+/// configs so existing users don't see a sudden 6 dB jump.
+fn window_db_shift(w: WindowFunction) -> f32 {
+    match w {
+        WindowFunction::Rectangular    => 0.0,
+        WindowFunction::Hann           => 6.0,
+        WindowFunction::Hamming        => 5.3,
+        WindowFunction::BlackmanHarris => 8.9,
+        WindowFunction::FlatTop        => 13.3,
+    }
+}
+
 impl AudioPreset {
     pub fn all() -> [AudioPreset; 15] {
         [
@@ -737,6 +755,7 @@ impl AudioPreset {
             },
             AudioPreset::Rock => AudioSettings {
                 fft_size: 2048, window_function: WindowFunction::Hamming,
+                min_decibels: -90.0, max_decibels: -25.0,
                 sensitivity: 55.0, response_gamma: 1.6, spectrum_tilt: 2.0,
                 target_dynamic_range_db: 60.0, attack_time_ms: 3.0,
                 decay_time_ms: 250.0, decay_mode: DecayMode::Exponential,
@@ -763,7 +782,7 @@ impl AudioPreset {
             },
             AudioPreset::Classical => AudioSettings {
                 fft_size: 4096, window_function: WindowFunction::BlackmanHarris,
-                min_decibels: -95.0, max_decibels: -15.0, target_dynamic_range_db: 75.0,
+                min_decibels: -104.0, max_decibels: -24.0, target_dynamic_range_db: 75.0,
                 sensitivity: 65.0, response_gamma: 1.2, spectrum_tilt: 4.5,
                 agc_enabled: false, attack_time_ms: 15.0, decay_time_ms: 500.0,
                 decay_mode: DecayMode::Linear, average_size: 3,
@@ -772,7 +791,7 @@ impl AudioPreset {
             },
             AudioPreset::Piano => AudioSettings {
                 fft_size: 4096, window_function: WindowFunction::BlackmanHarris,
-                min_decibels: -90.0, max_decibels: -20.0, target_dynamic_range_db: 65.0,
+                min_decibels: -99.0, max_decibels: -29.0, target_dynamic_range_db: 65.0,
                 sensitivity: 60.0, response_gamma: 1.3, spectrum_tilt: 4.5,
                 attack_time_ms: 5.0, decay_time_ms: 600.0, decay_mode: DecayMode::Exponential,
                 average_size: 2, beat_detection_sensitivity: 0.35,
@@ -782,14 +801,14 @@ impl AudioPreset {
             },
             AudioPreset::Jazz => AudioSettings {
                 fft_size: 2048, window_function: WindowFunction::Hamming,
-                min_decibels: -85.0, max_decibels: -22.0, target_dynamic_range_db: 60.0,
+                min_decibels: -90.0, max_decibels: -27.0, target_dynamic_range_db: 60.0,
                 sensitivity: 55.0, response_gamma: 1.4, spectrum_tilt: 3.5,
                 attack_time_ms: 10.0, decay_time_ms: 400.0, decay_mode: DecayMode::Exponential,
                 average_size: 3, beat_detection_sensitivity: 0.45, ..d
             },
             AudioPreset::Ambient => AudioSettings {
                 fft_size: 4096, window_function: WindowFunction::BlackmanHarris,
-                min_decibels: -95.0, max_decibels: -25.0, target_dynamic_range_db: 70.0,
+                min_decibels: -104.0, max_decibels: -34.0, target_dynamic_range_db: 70.0,
                 sensitivity: 70.0, response_gamma: 1.2, spectrum_tilt: 4.5,
                 attack_time_ms: 40.0, decay_time_ms: 800.0, decay_mode: DecayMode::Exponential,
                 average_size: 6, beat_detection_sensitivity: 0.3, ..d
@@ -797,7 +816,7 @@ impl AudioPreset {
 
             AudioPreset::LoFi => AudioSettings {
                 fft_size: 2048, window_function: WindowFunction::Hann,
-                min_decibels: -80.0, max_decibels: -22.0, target_dynamic_range_db: 55.0,
+                min_decibels: -86.0, max_decibels: -28.0, target_dynamic_range_db: 55.0,
                 sensitivity: 60.0, response_gamma: 1.4, spectrum_tilt: 2.0,
                 attack_time_ms: 8.0, decay_time_ms: 400.0,
                 decay_mode: DecayMode::Exponential,
@@ -807,7 +826,7 @@ impl AudioPreset {
             },
             AudioPreset::Metal => AudioSettings {
                 fft_size: 2048, window_function: WindowFunction::Hamming,
-                min_decibels: -85.0, max_decibels: -18.0, target_dynamic_range_db: 55.0,
+                min_decibels: -90.0, max_decibels: -23.0, target_dynamic_range_db: 55.0,
                 sensitivity: 60.0, response_gamma: 1.9, spectrum_tilt: 1.0,
                 attack_time_ms: 1.0, decay_time_ms: 180.0,
                 decay_mode: DecayMode::Exponential,
@@ -834,7 +853,7 @@ impl AudioPreset {
             AudioPreset::Vocal => AudioSettings {
                 fft_size: 4096, window_function: WindowFunction::Hann,
                 min_frequency_hz: 80.0, max_frequency_hz: 12000.0,
-                min_decibels: -90.0, max_decibels: -20.0, target_dynamic_range_db: 65.0,
+                min_decibels: -96.0, max_decibels: -26.0, target_dynamic_range_db: 65.0,
                 sensitivity: 60.0, response_gamma: 1.3, spectrum_tilt: 3.5,
                 attack_time_ms: 10.0, decay_time_ms: 400.0,
                 average_size: 3, beat_detection_sensitivity: 0.3,
@@ -844,7 +863,7 @@ impl AudioPreset {
             AudioPreset::Podcast => AudioSettings {
                 fft_size: 4096, window_function: WindowFunction::BlackmanHarris,
                 min_frequency_hz: 100.0, max_frequency_hz: 6000.0,
-                min_decibels: -95.0, max_decibels: -20.0, target_dynamic_range_db: 70.0,
+                min_decibels: -104.0, max_decibels: -29.0, target_dynamic_range_db: 70.0,
                 sensitivity: 65.0, response_gamma: 1.2, spectrum_tilt: 4.0,
                 attack_time_ms: 20.0, decay_time_ms: 600.0,
                 decay_mode: DecayMode::Exponential,
@@ -1041,6 +1060,8 @@ where D: serde::Deserializer<'de> {
 // App config
 // ─────────────────────────────────────────────────────────────
 
+pub const CURRENT_CONFIG_VERSION: u32 = 1;
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AppConfig {
     // Layout
@@ -1092,6 +1113,10 @@ pub struct AppConfig {
     #[serde(default)] pub track_info: TrackInfoConfig,
     #[serde(default)] pub audio: AudioSettings,
     #[serde(default)] pub custom_audio_presets: Vec<CustomAudioPreset>,
+
+    // Schema version — 0 or missing = pre-v1 (pre window-gain compensation),
+    // 1 = current. Used to drive one-shot migrations in `migrate()`.
+    #[serde(default)] pub config_version: u32,
 
     // Legacy migration fields (kept for old configs; consumed during load())
     #[serde(default, skip_serializing_if = "Option::is_none")] pub num_bars: Option<usize>,
@@ -1147,6 +1172,7 @@ impl Default for AppConfig {
             track_info: TrackInfoConfig::default(),
             audio: AudioSettings::default(),
             custom_audio_presets: Vec::new(),
+            config_version: CURRENT_CONFIG_VERSION,
             num_bars: None, fft_size: None, audio_update_ms: None, sensitivity: None,
             bar_color: None, static_colors: None, gradient_stops: None, color_change_colors: None,
         }
@@ -1195,10 +1221,36 @@ impl AppConfig {
         self.color_change_presets = new_ccp;
     }
 
+    /// One-shot migration so persisted settings still look the same after the
+    /// audio-core window-gain correction (v0 → v1). Returns `true` if anything
+    /// was changed; the caller should save the config so the shift never runs
+    /// twice on the same file.
+    fn migrate(&mut self) -> bool {
+        let mut changed = false;
+
+        if self.config_version < 1 {
+            let shift = window_db_shift(self.audio.window_function);
+            self.audio.min_decibels -= shift;
+            self.audio.max_decibels -= shift;
+
+            for p in &mut self.custom_audio_presets {
+                let s = window_db_shift(p.settings.window_function);
+                p.settings.min_decibels -= s;
+                p.settings.max_decibels -= s;
+            }
+
+            self.config_version = 1;
+            changed = true;
+        }
+
+        changed
+    }
+
     pub fn load() -> Self {
         let path = Self::get_path();
         if let Ok(content) = std::fs::read_to_string(path) {
             if let Ok(mut config) = toml::from_str::<AppConfig>(&content) {
+                // ── legacy field migration (pre-audio-core) ──
                 if let Some(c) = config.bar_color.take() {
                     config.static_single_source = ColorSource::Static(vec![c]);
                 }
@@ -1220,7 +1272,16 @@ impl AppConfig {
                     config.audio.sensitivity = s.clamp(0.0, 100.0);
                 }
 
+                // ── audio-core v1 migration (window-gain compensation) ──
+                let migrated = config.migrate();
+
                 config.refresh_premade_presets();
+
+                // Persist immediately so the dB shift never runs twice on this file.
+                if migrated {
+                    config.save();
+                }
+
                 return config;
             }
         }
