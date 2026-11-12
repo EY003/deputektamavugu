@@ -4429,6 +4429,26 @@ impl VisualizerApp {
             self.is_passthrough_set = want_passthrough;
         }
     }
+
+    /// Decide whether another frame is needed.
+    /// - Audio moving      -> repaint continuously (vsync-paced).
+    /// - Silent, but the track text colour is animated -> ~30 fps is enough.
+    /// - Otherwise         -> sleep; the 500 ms heartbeat / input events wake us.
+    fn schedule_repaint(&self, ctx: &egui::Context) {
+        let has_audio = self.current_bars.iter().any(|&v| v > 0.0005)
+            || self.current_peaks.iter().any(|&v| v > 0.0005);
+        if has_audio {
+            ctx.request_repaint();
+            return;
+        }
+
+        let text_animates = self.track_info.is_some()
+            && self.config.color_mode == ColorMode::Animated
+            && self.config.track_info.color_mode == TrackTextColorMode::Visualizer;
+        if text_animates {
+            ctx.request_repaint_after(Duration::from_millis(33));
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -4591,13 +4611,7 @@ impl eframe::App for VisualizerApp {
             ov.tick();
         }
         ctx.request_repaint_after(Duration::from_millis(500));
-
-        let moving = self.current_bars.iter().any(|&v| v > 0.0005)
-            || self.current_peaks.iter().any(|&v| v > 0.0005)
-            || self.config.color_mode == ColorMode::Animated;
-        if moving {
-            ctx.request_repaint();
-        }
+        self.schedule_repaint(ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&glow::Context>) {
