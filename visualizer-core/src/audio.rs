@@ -1,10 +1,13 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{
+    Receiver, RecvTimeoutError, SendTimeoutError, Sender, TrySendError,
+};
 use realfft::num_complex::Complex32;
 use realfft::{RealFftPlanner, RealToComplex};
 use wasapi::*;
@@ -14,11 +17,11 @@ use crate::config::{
     WeightingCurve, WindowFunction,
 };
 
-const MIN_BEAT_GAP_S: f64 = 0.25;   // max 240 BPM raw trigger rate
+const MIN_BEAT_GAP_S: f64 = 0.25;
 const BPM_FOLD_MIN: f64 = 70.0;
 const BPM_FOLD_MAX: f64 = 180.0;
-const BEAT_MEMORY_S: f64 = 8.0;     // forget beats older than this
-const BEAT_TIMEOUT_S: f64 = 5.0;    // no beat for this long => BPM = 0
+const BEAT_MEMORY_S: f64 = 8.0;
+const BEAT_TIMEOUT_S: f64 = 5.0;
 const MAX_BEATS: usize = 12;
 
 // ─────────────────────────────────────────────────────────────
@@ -39,6 +42,7 @@ pub struct AudioEngine {
     pub device_name: String,
     pub frame_rx: Receiver<BarFrame>,
     pub settings: Arc<ArcSwap<AudioSettings>>,
+    stop: Arc<AtomicBool>,
 }
 
 impl AudioEngine {
@@ -47,107 +51,204 @@ impl AudioEngine {
         F: Fn() + Send + 'static,
     {
         let settings = Arc::new(ArcSwap::from_pointee(initial));
+        let stop = Arc::new(AtomicBool::new(false));
 
         let (frame_tx, frame_rx) = crossbeam_channel::bounded(2);
         let (sample_tx, sample_rx) = crossbeam_channel::bounded::<Vec<f32>>(32);
+        let (ctrl_tx, ctrl_rx) = crossbeam_channel::unbounded::<ControlMsg>();
         let (info_tx, info_rx) = crossbeam_channel::bounded(1);
 
+        let sample_rate_shared = Arc::new(AtomicU32::new(48_000u32.to_bits()));
+
         let settings_for_capture = settings.clone();
-        let capture_handle = thread::spawn(move || {
-            capture_loop(settings_for_capture, sample_tx, info_tx);
+        let stop_cap = stop.clone();
+        let sr_cap = sample_rate_shared.clone();
+        thread::spawn(move || {
+            capture_loop(settings_for_capture, sample_tx, ctrl_tx, info_tx, sr_cap, stop_cap);
         });
 
         let (device_name, sample_rate) = info_rx
             .recv()
             .unwrap_or_else(|_| ("Unknown".to_string(), 48000.0));
+        sample_rate_shared.store(sample_rate.to_bits(), Ordering::Relaxed);
 
         let settings_for_analysis = settings.clone();
+        let stop_an = stop.clone();
+        let sr_an = sample_rate_shared.clone();
         thread::spawn(move || {
-            analysis_loop(settings_for_analysis, sample_rx, frame_tx, sample_rate, on_frame);
+            analysis_loop(settings_for_analysis, sample_rx, ctrl_rx, frame_tx, sr_an, stop_an, on_frame);
         });
 
-        drop(capture_handle);
-        Self { device_name, frame_rx, settings }
+        Self { device_name, frame_rx, settings, stop }
+    }
+}
+
+impl Drop for AudioEngine {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
     }
 }
 
 // ─────────────────────────────────────────────────────────────
-// Capture thread — unchanged (already event-driven)
+// Capture
 // ─────────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+enum ControlMsg {
+    ResetDcBlocker,
+}
+
+#[derive(Debug)]
+enum SessionEnd {
+    Stopped,
+    Disconnected,
+    Invalidated,
+    Fatal,
+}
 
 fn capture_loop(
     settings: Arc<ArcSwap<AudioSettings>>,
     sample_tx: Sender<Vec<f32>>,
+    ctrl_tx: Sender<ControlMsg>,
     info_tx: Sender<(String, f32)>,
+    sample_rate_shared: Arc<AtomicU32>,
+    stop: Arc<AtomicBool>,
 ) {
     let _ = initialize_mta();
+    let mut sent_info = false;
+    let mut backoff = Duration::from_millis(500);
 
+    loop {
+        if stop.load(Ordering::Relaxed) { return; }
+        match capture_session(
+            &settings, &sample_tx, &ctrl_tx, &info_tx,
+            &sample_rate_shared, &stop, &mut sent_info,
+        ) {
+            SessionEnd::Stopped | SessionEnd::Disconnected | SessionEnd::Fatal => return,
+            SessionEnd::Invalidated => {
+                eprintln!("WASAPI: device invalidated, retrying in {:?}", backoff);
+                thread::sleep(backoff);
+                backoff = (backoff * 2).min(Duration::from_secs(5));
+            }
+        }
+    }
+}
+
+fn capture_session(
+    settings: &Arc<ArcSwap<AudioSettings>>,
+    sample_tx: &Sender<Vec<f32>>,
+    ctrl_tx: &Sender<ControlMsg>,
+    info_tx: &Sender<(String, f32)>,
+    sample_rate_shared: &Arc<AtomicU32>,
+    stop: &Arc<AtomicBool>,
+    sent_info: &mut bool,
+) -> SessionEnd {
     let device = match get_default_device(&Direction::Render) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("WASAPI: failed to get default render device: {e:?}");
-            let _ = info_tx.send(("Unknown".to_string(), 48000.0));
-            return;
+            eprintln!("WASAPI: get_default_device failed: {e:?}");
+            if !*sent_info { let _ = info_tx.send(("Unknown".into(), 48_000.0)); }
+            return SessionEnd::Invalidated;
         }
     };
     let mut audio_client = match device.get_iaudioclient() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("WASAPI: failed to get IAudioClient: {e:?}");
-            let _ = info_tx.send(("Unknown".to_string(), 48000.0));
-            return;
+            eprintln!("WASAPI: get_iaudioclient failed: {e:?}");
+            if !*sent_info { let _ = info_tx.send(("Unknown".into(), 48_000.0)); }
+            return SessionEnd::Invalidated;
         }
     };
 
-    let device_name = device.get_friendlyname().unwrap_or_else(|_| "Default Device".to_string());
+    let device_name = device.get_friendlyname().unwrap_or_else(|_| "Default Device".into());
     let format = match audio_client.get_mixformat() {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("WASAPI: failed to get mix format: {e:?}");
-            let _ = info_tx.send((device_name, 48000.0));
-            return;
+            eprintln!("WASAPI: get_mixformat failed: {e:?}");
+            if !*sent_info { let _ = info_tx.send((device_name, 48_000.0)); }
+            return SessionEnd::Invalidated;
         }
     };
     let sample_rate = format.get_samplespersec() as f32;
     let channels = format.get_nchannels() as usize;
     let blockalign = format.get_blockalign() as usize;
-    let samples_per_frame = (blockalign / 4).max(1);
+    let bits = format.get_bitspersample() as usize;
+
+    if bits != 32 {
+        eprintln!(
+            "WASAPI: non-float mix format ({bits} bits). \
+             Samples-per-frame assumes 32-bit float; audio will be garbled."
+        );
+    }
+    let samples_per_frame = (blockalign / 4).max(1).max(channels);
 
     let (_, min_time) = match audio_client.get_periods() {
         Ok(p) => p,
-        Err(_) => (100_000i64, 100_000i64),
+        Err(e) => {
+            eprintln!("WASAPI: get_periods failed: {e:?}");
+            (100_000i64, 100_000i64)
+        }
     };
-    if audio_client.initialize_client(&format, min_time, &Direction::Capture, &ShareMode::Shared, true).is_err() {
-        let _ = info_tx.send((device_name, sample_rate));
-        return;
+    if let Err(e) = audio_client.initialize_client(
+        &format, min_time, &Direction::Capture, &ShareMode::Shared, true,
+    ) {
+        eprintln!("WASAPI: initialize_client failed: {e:?}");
+        if !*sent_info { let _ = info_tx.send((device_name, sample_rate)); }
+        return SessionEnd::Invalidated;
     }
 
     let h_event = match audio_client.set_get_eventhandle() {
         Ok(h) => h,
-        Err(_) => { let _ = info_tx.send((device_name, sample_rate)); return; }
+        Err(e) => {
+            eprintln!("WASAPI: set_get_eventhandle failed: {e:?}");
+            if !*sent_info { let _ = info_tx.send((device_name, sample_rate)); }
+            return SessionEnd::Invalidated;
+        }
     };
     let capture_client = match audio_client.get_audiocaptureclient() {
         Ok(c) => c,
-        Err(_) => { let _ = info_tx.send((device_name, sample_rate)); return; }
+        Err(e) => {
+            eprintln!("WASAPI: get_audiocaptureclient failed: {e:?}");
+            if !*sent_info { let _ = info_tx.send((device_name, sample_rate)); }
+            return SessionEnd::Invalidated;
+        }
     };
-
-    if audio_client.start_stream().is_err() {
-        let _ = info_tx.send((device_name, sample_rate));
-        return;
+    if let Err(e) = audio_client.start_stream() {
+        eprintln!("WASAPI: start_stream failed: {e:?}");
+        if !*sent_info { let _ = info_tx.send((device_name, sample_rate)); }
+        return SessionEnd::Invalidated;
     }
-    let _ = info_tx.send((device_name, sample_rate));
+
+    if !*sent_info {
+        let _ = info_tx.send((device_name, sample_rate));
+        *sent_info = true;
+    }
+    sample_rate_shared.store(sample_rate.to_bits(), Ordering::Relaxed);
 
     let mut sample_buffer: Vec<f32> = Vec::new();
     let mut mono: Vec<f32> = Vec::with_capacity(4096);
 
     loop {
+        if stop.load(Ordering::Relaxed) {
+            let _ = audio_client.stop_stream();
+            return SessionEnd::Stopped;
+        }
+
         let waited_at = Instant::now();
         if h_event.wait_for_event(250).is_err() && waited_at.elapsed() < Duration::from_millis(20) {
             thread::sleep(Duration::from_millis(100));
         }
 
         loop {
-            let packet_size = capture_client.get_next_nbr_frames().ok().flatten().unwrap_or(0);
+            let packet_size = match capture_client.get_next_nbr_frames() {
+                Ok(Some(n)) => n,
+                Ok(None) => 0,
+                Err(e) => {
+                    eprintln!("WASAPI: get_next_nbr_frames error: {e:?}");
+                    let _ = audio_client.stop_stream();
+                    return SessionEnd::Invalidated;
+                }
+            };
             if packet_size == 0 { break; }
 
             let needed = packet_size as usize * samples_per_frame;
@@ -158,8 +259,22 @@ fn capture_loop(
                     needed * std::mem::size_of::<f32>(),
                 )
             };
-            let (frames_read, _) = capture_client.read_from_device(byte_slice).unwrap_or((0, BufferFlags::none()));
+            let (frames_read, flags) = match capture_client.read_from_device(byte_slice) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("WASAPI: read_from_device error: {e:?}");
+                    let _ = audio_client.stop_stream();
+                    return SessionEnd::Invalidated;
+                }
+            };
             if frames_read == 0 { break; }
+
+            if flags.contains(BufferFlags::DATA_DISCONTINUITY) {
+                let _ = ctrl_tx.try_send(ControlMsg::ResetDcBlocker);
+            }
+            if flags.contains(BufferFlags::SILENT) {
+                sample_buffer[..needed].fill(0.0);
+            }
 
             let valid_samples = (frames_read as usize * samples_per_frame).min(sample_buffer.len());
             let samples = &sample_buffer[..valid_samples];
@@ -168,24 +283,48 @@ fn capture_loop(
             mono.clear();
             mono.reserve(valid_samples / channels.max(1));
             for chunk in samples.chunks_exact(channels.max(1)) {
-                if channels >= 2 {
-                    let l = chunk[0];
-                    let r = chunk[1];
-                    let val = match mix_mode {
-                        ChannelMixMode::Mono | ChannelMixMode::Mid => (l + r) * 0.5,
-                        ChannelMixMode::Left => l,
-                        ChannelMixMode::Right => r,
-                        ChannelMixMode::Side => (l - r) * 0.5,
-                    };
-                    mono.push(val);
-                } else {
-                    mono.push(chunk[0]);
-                }
+                mono.push(downmix(chunk, mix_mode));
             }
             if mono.is_empty() { continue; }
             let out = std::mem::replace(&mut mono, Vec::with_capacity(4096));
-            if sample_tx.send(out).is_err() { return; }
+            match sample_tx.send_timeout(out, Duration::from_millis(50)) {
+                Ok(()) => {}
+                Err(SendTimeoutError::Timeout(_)) => {
+                    // analysis is slow; drop and continue
+                }
+                Err(SendTimeoutError::Disconnected(_)) => {
+                    let _ = audio_client.stop_stream();
+                    return SessionEnd::Disconnected;
+                }
+            }
         }
+    }
+}
+
+fn downmix(chunk: &[f32], mode: ChannelMixMode) -> f32 {
+    let n = chunk.len();
+    match n {
+        0 => 0.0,
+        1 => chunk[0],
+        _ => match mode {
+            ChannelMixMode::Left => chunk[0],
+            ChannelMixMode::Right => chunk[1],
+            ChannelMixMode::Side => (chunk[0] - chunk[1]) * 0.5,
+            ChannelMixMode::Mono | ChannelMixMode::Mid => {
+                if n == 2 {
+                    (chunk[0] + chunk[1]) * 0.5
+                } else {
+                    // Windows mix-format order: FL, FR, FC, LFE, BL, BR, (SL, SR)
+                    let mut sum = chunk[0] + chunk[1];
+                    let mut wsum = 2.0;
+                    if n >= 3 { sum += chunk[2] * 0.707; wsum += 0.707; }
+                    if n >= 4 { sum += chunk[3] * 0.5;   wsum += 0.5; }
+                    if n >= 6 { sum += (chunk[4] + chunk[5]) * 0.707; wsum += 1.414; }
+                    for i in 6..n { sum += chunk[i] * 0.5; wsum += 0.5; }
+                    sum / wsum
+                }
+            }
+        },
     }
 }
 
@@ -215,17 +354,20 @@ impl DcBlocker {
             *s = y;
         }
     }
+    fn reset(&mut self) { self.x = 0.0; self.y = 0.0; }
 }
 
 fn analysis_loop<F: Fn() + Send + 'static>(
     settings: Arc<ArcSwap<AudioSettings>>,
     sample_rx: Receiver<Vec<f32>>,
+    ctrl_rx: Receiver<ControlMsg>,
     frame_tx: Sender<BarFrame>,
-    sample_rate: f32,
+    sample_rate_shared: Arc<AtomicU32>,
+    stop: Arc<AtomicBool>,
     on_frame: F,
 ) {
+    let mut sample_rate = f32::from_bits(sample_rate_shared.load(Ordering::Relaxed));
     let mut processor = AudioProcessor::new(sample_rate);
-    // Pre-allocated history buffer; we reuse it instead of reallocating.
     let mut history: Vec<f32> = Vec::with_capacity(16_384);
     let mut dc = DcBlocker::new(sample_rate);
     let sleeper = spin_sleep::SpinSleeper::new(500_000);
@@ -235,24 +377,67 @@ fn analysis_loop<F: Fn() + Send + 'static>(
     let mut last_chunk = Instant::now();
     let mut idle = false;
     let mut last_sent_zero = false;
+    let mut pending_beat = false;
+    let mut silent_frame_pending: Option<BarFrame> = None;
 
     loop {
+        if stop.load(Ordering::Relaxed) { return; }
+
+        // Drain control messages
+        while let Ok(msg) = ctrl_rx.try_recv() {
+            match msg {
+                ControlMsg::ResetDcBlocker => dc.reset(),
+            }
+        }
+
+        // Detect sample-rate change (e.g. after device invalidation)
+        let new_sr = f32::from_bits(sample_rate_shared.load(Ordering::Relaxed));
+        if (new_sr - sample_rate).abs() > 0.5 {
+            eprintln!("Audio: sample rate changed {sample_rate} -> {new_sr}, rebuilding processor");
+            sample_rate = new_sr;
+            processor = AudioProcessor::new(sample_rate);
+            dc = DcBlocker::new(sample_rate);
+            history.clear();
+        }
+
         let current = settings.load_full();
 
-        if idle {
-            let mut chunk = match sample_rx.recv() {
-                Ok(c) => c,
-                Err(_) => return,
-            };
-            if peak_abs(&chunk) <= LOUD_THRESHOLD {
-                continue;
+        // Retry pending silent frame
+        if let Some(frame) = silent_frame_pending.take() {
+            match frame_tx.send_timeout(frame.clone(), Duration::from_millis(100)) {
+                Ok(()) => { last_sent_zero = true; on_frame(); }
+                Err(SendTimeoutError::Timeout(_)) => { silent_frame_pending = Some(frame); }
+                Err(SendTimeoutError::Disconnected(_)) => return,
             }
+        }
+
+        if idle {
+            // Regenerate silent frame if num_bars changed while idle.
+            if current.num_bars != processor.bar_values.len()
+                && silent_frame_pending.is_none()
+            {
+                processor.update_initial_state(&current);
+                let frame = processor.silent_frame();
+                match frame_tx.try_send(frame.clone()) {
+                    Ok(()) => { last_sent_zero = true; on_frame(); }
+                    Err(TrySendError::Full(_)) => { silent_frame_pending = Some(frame); }
+                    Err(TrySendError::Disconnected(_)) => return,
+                }
+            }
+
+            let mut chunk = match sample_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(c) => c,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => return,
+            };
+            if peak_abs(&chunk) <= LOUD_THRESHOLD { continue; }
             idle = false;
             let now = Instant::now();
             last_loud = now;
             last_chunk = now;
             last_tick = now;
             if current.dc_block { dc.apply(&mut chunk); }
+            history.clear();
             history.extend_from_slice(&chunk);
         }
 
@@ -273,7 +458,6 @@ fn analysis_loop<F: Fn() + Send + 'static>(
 
         if !got_chunk && last_chunk.elapsed() > Duration::from_millis(60) {
             let n = ((dt_raw * sample_rate) as usize).min(16_384);
-            // Reuse capacity: resize only if needed.
             history.resize(history.len() + n, 0.0);
         }
 
@@ -283,13 +467,25 @@ fn analysis_loop<F: Fn() + Send + 'static>(
             history.drain(0..drop_n);
         }
 
-        if let Some(frame) = processor.process(&history, &current, dt) {
+        if let Some(mut frame) = processor.process(&history, &current, dt) {
+            if pending_beat { frame.beat = true; }
+            if frame.beat { pending_beat = true; }
+
             let is_zero = frame.values.iter().all(|&v| v == 0.0)
                 && frame.peaks.iter().all(|&v| v == 0.0);
-            if !(is_zero && last_sent_zero) {
-                if frame_tx.try_send(frame).is_ok() {
-                    last_sent_zero = is_zero;
-                    on_frame();
+            let should_send = !(is_zero && last_sent_zero) || frame.beat;
+
+            if should_send {
+                match frame_tx.try_send(frame) {
+                    Ok(()) => {
+                        last_sent_zero = is_zero;
+                        pending_beat = false;
+                        on_frame();
+                    }
+                    Err(TrySendError::Full(_)) => {
+                        // keep pending_beat; caller should retry next frame
+                    }
+                    Err(TrySendError::Disconnected(_)) => return,
                 }
             }
         }
@@ -297,10 +493,14 @@ fn analysis_loop<F: Fn() + Send + 'static>(
         if last_loud.elapsed() > IDLE_AFTER && processor.is_silent() {
             processor.snap_to_silence();
             let frame = processor.silent_frame();
-            on_frame();
-            let _ = frame_tx.send_timeout(frame, Duration::from_millis(200));
-            on_frame();
-            last_sent_zero = true;
+            match frame_tx.try_send(frame.clone()) {
+                Ok(()) => { last_sent_zero = true; on_frame(); }
+                Err(TrySendError::Full(_)) => {
+                    silent_frame_pending = Some(frame);
+                    on_frame();
+                }
+                Err(TrySendError::Disconnected(_)) => return,
+            }
             history.clear();
             history.resize(current.fft_size, 0.0);
             idle = true;
@@ -315,7 +515,7 @@ fn analysis_loop<F: Fn() + Send + 'static>(
 }
 
 // ─────────────────────────────────────────────────────────────
-// The processor — buffers are pre-allocated and reused.
+// The processor
 // ─────────────────────────────────────────────────────────────
 
 struct AudioProcessor {
@@ -323,6 +523,7 @@ struct AudioProcessor {
     cached_fft_size: usize,
     fft: Arc<dyn RealToComplex<f32>>,
     window: Vec<f32>,
+    window_gain: f32,
     cached_window_fn: WindowFunction,
     input_buffer: Vec<f32>,
     output_buffer: Vec<Complex32>,
@@ -340,30 +541,26 @@ struct AudioProcessor {
     bar_velocities: Vec<f32>,
     peak_hold_remaining: Vec<f32>,
 
-    // Reusable scratch buffers (sized to num_bars)
     raw_bars: Vec<f32>,
     tmp_bars: Vec<f32>,
     bloom_bars: Vec<f32>,
     mapped: Vec<f32>,
     smoothed: Vec<f32>,
 
-    // Flat ring buffer for frame averaging: `avg * num_bars` values.
     frame_ring: Vec<f32>,
     frame_ring_pos: usize,
     frame_ring_count: usize,
+    cached_avg: usize,
 
     agc_envelope: f32,
 
-    // Beat history: VecDeque + running sum.
     beat_energy_history: VecDeque<f32>,
-    beat_energy_sum: f32,
     beat_times: VecDeque<f64>,
     bpm: f32,
     phase: f32,
     beat_envelope: f32,
     time_elapsed: f64,
 
-    // Patch 6: edge-detection and cached per-bar dB offsets.
     beat_armed: bool,
     bar_offset_db: Vec<f32>,
     offset_centers: Vec<f32>,
@@ -382,28 +579,26 @@ impl AudioProcessor {
         let scratch_buffer = fft.make_scratch_vec();
 
         let window = make_window(window_fn, fft_size);
-        let bin_ranges = make_bin_ranges(fft_size, 80, FrequencyScaling::Logarithmic,
-                                          sample_rate, 30.0, 16000.0);
-        let bin_centers_hz = centers_from_ranges(&bin_ranges, fft_size, sample_rate);
-
+        let window_gain = compute_window_gain(&window);
         let num_bars = 80;
-        let avg = 1;
+        let bin_ranges = make_bin_ranges(
+            fft_size, num_bars, FrequencyScaling::Logarithmic, sample_rate, 30.0, 16_000.0,
+        );
+        let bin_centers_hz = compute_bar_centers_hz(
+            num_bars, FrequencyScaling::Logarithmic, 30.0, 16_000.0,
+        );
 
         Self {
             sample_rate,
             cached_fft_size: fft_size,
-            fft,
-            window,
+            fft, window, window_gain,
             cached_window_fn: window_fn,
-            input_buffer,
-            output_buffer,
-            scratch_buffer,
+            input_buffer, output_buffer, scratch_buffer,
             cached_num_bars: num_bars,
             cached_scaling: FrequencyScaling::Logarithmic,
             cached_min_freq: 30.0,
-            cached_max_freq: 16000.0,
-            bin_ranges,
-            bin_centers_hz,
+            cached_max_freq: 16_000.0,
+            bin_ranges, bin_centers_hz,
             bar_values: vec![0.0; num_bars],
             bar_peaks: vec![0.0; num_bars],
             bar_velocities: vec![0.0; num_bars],
@@ -413,12 +608,12 @@ impl AudioProcessor {
             bloom_bars: vec![0.0; num_bars],
             mapped: vec![0.0; num_bars],
             smoothed: vec![0.0; num_bars],
-            frame_ring: vec![0.0; avg * num_bars],
+            frame_ring: vec![0.0; num_bars],
             frame_ring_pos: 0,
             frame_ring_count: 0,
+            cached_avg: 1,
             agc_envelope: 1.0,
             beat_energy_history: VecDeque::with_capacity(240),
-            beat_energy_sum: 0.0,
             beat_times: VecDeque::with_capacity(8),
             bpm: 0.0,
             phase: 0.0,
@@ -427,13 +622,11 @@ impl AudioProcessor {
             beat_armed: true,
             bar_offset_db: Vec::new(),
             offset_centers: Vec::new(),
-            offset_params: [f32::NAN; 4], // NaN never equals => forces first build
+            offset_params: [f32::NAN; 4],
             offset_weighting: u8::MAX,
         }
     }
 
-    /// tilt + EQ + weighting depend only on settings and the bar's centre
-    /// frequency, so compute them when those change, not every frame.
     fn refresh_bar_offsets(&mut self, s: &AudioSettings) {
         let w_id = match s.weighting {
             WeightingCurve::None => 0u8,
@@ -455,13 +648,12 @@ impl AudioProcessor {
         self.bar_offset_db.clear();
         for &f in &self.bin_centers_hz {
             let tilt_db = s.spectrum_tilt * (f / 1000.0).log2();
-            let eq_db = if f < 250.0 {
-                s.eq_bass_db
-            } else if f < 4000.0 {
-                s.eq_mid_db
-            } else {
-                s.eq_treble_db
-            };
+            // Smoothly crossfade bass/mid/treble instead of hard steps.
+            let bm = smoothstep(f, 125.0, 500.0);
+            let mt = smoothstep(f, 2000.0, 8000.0);
+            let eq_db = s.eq_bass_db * (1.0 - bm)
+                + s.eq_mid_db * (bm - mt)
+                + s.eq_treble_db * mt;
             let weight_db = match s.weighting {
                 WeightingCurve::None => 0.0,
                 WeightingCurve::AWeighting => a_weighting_db(f),
@@ -473,6 +665,9 @@ impl AudioProcessor {
 
     fn update_initial_state(&mut self, s: &AudioSettings) {
         if s.fft_size != self.cached_fft_size {
+            if !s.fft_size.is_power_of_two() || s.fft_size < 256 {
+                return; // ignore invalid; keep last working config
+            }
             let mut planner = RealFftPlanner::new();
             self.fft = planner.plan_fft_forward(s.fft_size);
             self.input_buffer = self.fft.make_input_vec();
@@ -481,26 +676,32 @@ impl AudioProcessor {
             self.cached_fft_size = s.fft_size;
             self.cached_window_fn = s.window_function;
             self.window = make_window(s.window_function, s.fft_size);
-            self.bin_ranges = make_bin_ranges(s.fft_size, s.num_bars, s.frequency_scaling,
-                                              self.sample_rate, s.min_frequency_hz, s.max_frequency_hz);
-            self.bin_centers_hz = centers_from_ranges(&self.bin_ranges, s.fft_size, self.sample_rate);
-        }
-        if s.window_function != self.cached_window_fn {
+            self.window_gain = compute_window_gain(&self.window);
+        } else if s.window_function != self.cached_window_fn {
             self.cached_window_fn = s.window_function;
             self.window = make_window(s.window_function, s.fft_size);
+            self.window_gain = compute_window_gain(&self.window);
         }
+
         if s.num_bars != self.cached_num_bars
             || s.frequency_scaling != self.cached_scaling
             || s.min_frequency_hz != self.cached_min_freq
             || s.max_frequency_hz != self.cached_max_freq
         {
+            if s.num_bars == 0 || s.min_frequency_hz >= s.max_frequency_hz {
+                return;
+            }
             self.cached_num_bars = s.num_bars;
             self.cached_scaling = s.frequency_scaling;
             self.cached_min_freq = s.min_frequency_hz;
             self.cached_max_freq = s.max_frequency_hz;
-            self.bin_ranges = make_bin_ranges(s.fft_size, s.num_bars, s.frequency_scaling,
-                                              self.sample_rate, s.min_frequency_hz, s.max_frequency_hz);
-            self.bin_centers_hz = centers_from_ranges(&self.bin_ranges, s.fft_size, self.sample_rate);
+            self.bin_ranges = make_bin_ranges(
+                s.fft_size, s.num_bars, s.frequency_scaling,
+                self.sample_rate, s.min_frequency_hz, s.max_frequency_hz,
+            );
+            self.bin_centers_hz = compute_bar_centers_hz(
+                s.num_bars, s.frequency_scaling, s.min_frequency_hz, s.max_frequency_hz,
+            );
             self.resize_bar_state(s.num_bars);
         }
     }
@@ -519,12 +720,11 @@ impl AudioProcessor {
         self.frame_ring.fill(0.0);
         self.frame_ring_count = 0;
         self.beat_energy_history.clear();
-        self.beat_energy_sum = 0.0;
         self.beat_envelope = 0.0;
-        // New silence => the next track starts from scratch.
         self.beat_times.clear();
         self.beat_armed = true;
         self.bpm = 0.0;
+        self.agc_envelope = 1.0; // fix #1
     }
 
     fn silent_frame(&self) -> BarFrame {
@@ -548,7 +748,7 @@ impl AudioProcessor {
         self.bloom_bars.resize(n, 0.0);
         self.mapped.resize(n, 0.0);
         self.smoothed.resize(n, 0.0);
-        // Frame ring is resized lazily in process() based on avg.
+        self.frame_ring.resize(n, 0.0);
         self.frame_ring_pos = 0;
         self.frame_ring_count = 0;
     }
@@ -570,22 +770,26 @@ impl AudioProcessor {
         }
         let window_slice = &history[history.len() - n_fft..];
 
-        // AGC (before windowing)
+        // ---- AGC (fix #1) ----
         let raw_rms = {
             let sum_sq: f32 = window_slice.iter().map(|x| x * x).sum();
             (sum_sq / n_fft as f32).sqrt()
         };
-        if s.agc_enabled {
-            let desired = 0.08 / raw_rms.max(1e-6);
+        if s.agc_enabled && raw_rms > 1e-4 {
+            let desired = (0.08 / raw_rms.max(1e-6)).clamp(0.01, 20.0);
             let coeff = if desired < self.agc_envelope {
                 s.agc_attack.clamp(0.0001, 1.0)
             } else {
                 s.agc_release.clamp(0.0001, 1.0)
             };
-            self.agc_envelope += (desired - self.agc_envelope) * coeff;
-        } else {
+            // Treat config coeff as per-60fps-frame; scale by dt.
+            let alpha = 1.0 - (1.0 - coeff).powf(dt * 60.0);
+            self.agc_envelope += (desired - self.agc_envelope) * alpha;
+            self.agc_envelope = self.agc_envelope.clamp(0.01, 20.0);
+        } else if !s.agc_enabled {
             self.agc_envelope = 1.0;
         }
+        // if agc_enabled and silent: leave envelope frozen (do nothing)
         let agc_gain = self.agc_envelope.clamp(0.01, 20.0);
         let user_gain = s.raw_gain.max(0.01) * agc_gain;
 
@@ -593,27 +797,43 @@ impl AudioProcessor {
         for i in 0..n_fft {
             self.input_buffer[i] *= self.window[i];
         }
-        if self.fft.process_with_scratch(&mut self.input_buffer, &mut self.output_buffer, &mut self.scratch_buffer).is_err() {
+        if self.fft.process_with_scratch(
+            &mut self.input_buffer, &mut self.output_buffer, &mut self.scratch_buffer,
+        ).is_err() {
             return None;
         }
 
         let num_bars = self.cached_num_bars;
         let nyquist = n_fft / 2;
-        let norm = 1.0 / (n_fft as f32 / 2.0) * user_gain;
+        // Correct single-sided normalization, now window-aware.
+        let norm = self.window_gain * user_gain;
+        let bin_width = self.sample_rate / n_fft as f32;
 
-        // ── raw per-bar magnitudes (reuse buffer) ────────────────
+        // ---- raw per-bar magnitudes with interpolation for narrow bars (fix #6) ----
         for i in 0..num_bars {
             let (start, end) = self.bin_ranges[i];
             let end = end.min(nyquist).max(start + 1);
-            let mut mag = 0.0f32;
-            for bin in start..end {
-                mag += self.output_buffer[bin].norm();
+            let mag;
+            if end - start == 1 {
+                // Bar covers a single bin — interpolate at the true centre frequency.
+                let center_hz = self.bin_centers_hz.get(i).copied().unwrap_or(bin_width);
+                let pos = center_hz / bin_width;
+                let k = (pos.floor() as usize).min(nyquist);
+                let t = (pos - k as f32).clamp(0.0, 1.0);
+                let k1 = (k + 1).min(nyquist);
+                mag = self.output_buffer[k].norm() * (1.0 - t)
+                    + self.output_buffer[k1].norm() * t;
+            } else {
+                let mut sum = 0.0f32;
+                for bin in start..end {
+                    sum += self.output_buffer[bin].norm();
+                }
+                mag = sum / (end - start) as f32;
             }
-            mag /= (end - start) as f32;
             self.raw_bars[i] = (mag * norm + 1e-9).max(1e-9);
         }
 
-        // ── frequency-domain smoothing (reuse tmp) ───────────────
+        // ---- frequency-domain smoothing ----
         if s.frequency_smoothing > 0.0 {
             let alpha = s.frequency_smoothing.clamp(0.0, 1.0);
             self.tmp_bars.copy_from_slice(&self.raw_bars);
@@ -626,7 +846,7 @@ impl AudioProcessor {
             self.raw_bars.copy_from_slice(&self.tmp_bars);
         }
 
-        // ── harmonic emphasis (reuse bloom) ──────────────────────
+        // ---- harmonic emphasis ----
         if s.harmonic_emphasis && num_bars >= 5 {
             self.bloom_bars.copy_from_slice(&self.raw_bars);
             for i in 2..num_bars - 2 {
@@ -646,7 +866,7 @@ impl AudioProcessor {
             self.raw_bars.copy_from_slice(&self.bloom_bars);
         }
 
-        // ── dB mapping (reuse mapped) ────────────────────────────
+        // ---- dB mapping ----
         self.refresh_bar_offsets(s);
         let sens_norm = (s.sensitivity / 100.0).clamp(0.0, 1.0);
         let min_db_effective = s.min_decibels - (sens_norm - 0.5) * 20.0;
@@ -658,28 +878,24 @@ impl AudioProcessor {
             let db = 20.0 * self.raw_bars[i].log10();
             let tilted_db = db + self.bar_offset_db.get(i).copied().unwrap_or(0.0);
             let mut n01 = ((tilted_db - min_db_effective) / db_span).clamp(0.0, 1.0);
-            if n01 < s.noise_gate {
-                n01 = 0.0;
-            }
+            if n01 < s.noise_gate { n01 = 0.0; }
             self.mapped[i] = n01.powf(gamma);
         }
 
-        // ── time-domain smoothing using a flat ring buffer ───────
-        let avg = s.average_size.max(1);
+        // ---- time-domain averaging (fix #1: frame-rate independent) ----
+        let avg = ((s.average_size as f32 * s.poll_rate_hz / 60.0).round() as usize).max(1);
         let needed = avg * num_bars;
-        if self.frame_ring.len() != needed {
+        if self.frame_ring.len() != needed || self.cached_avg != avg {
             self.frame_ring.resize(needed, 0.0);
             self.frame_ring_pos = 0;
             self.frame_ring_count = 0;
+            self.cached_avg = avg;
         }
-        if self.frame_ring_count < avg {
-            self.frame_ring_count += 1;
-        }
+        if self.frame_ring_count < avg { self.frame_ring_count += 1; }
         let base = self.frame_ring_pos * num_bars;
         self.frame_ring[base..base + num_bars].copy_from_slice(&self.mapped);
         self.frame_ring_pos = (self.frame_ring_pos + 1) % avg;
 
-        // Sum all frames in the ring (reuse `smoothed` as accumulator).
         self.smoothed.fill(0.0);
         for f in 0..self.frame_ring_count {
             let offset = f * num_bars;
@@ -690,7 +906,7 @@ impl AudioProcessor {
         let inv = 1.0 / self.frame_ring_count as f32;
         for v in self.smoothed.iter_mut() { *v *= inv; }
 
-        // ── per-frame peak normalization ──────────────────────────
+        // ---- per-frame peak normalization ----
         if s.per_frame_normalization {
             let peak = self.smoothed.iter().cloned().fold(0.0f32, f32::max);
             if peak > 0.001 {
@@ -698,7 +914,7 @@ impl AudioProcessor {
             }
         }
 
-        // ── FIXED: move `smoothed` out to avoid the double-borrow ─
+        // ---- ballistics ----
         let smoothed = std::mem::take(&mut self.smoothed);
         self.update_ballistics(&smoothed, s, dt);
         self.smoothed = smoothed;
@@ -733,11 +949,8 @@ impl AudioProcessor {
                 (s.attack_time_ms, s.decay_time_ms)
             };
 
-            let attack_alpha = if atk_ms <= 0.0 {
-                1.0
-            } else {
-                1.0 - (-dt * 1000.0 / atk_ms).exp()
-            };
+            let attack_alpha = if atk_ms <= 0.0 { 1.0 }
+                else { 1.0 - (-dt * 1000.0 / atk_ms).exp() };
             let decay_s = (dec_ms / 1000.0).max(0.001);
 
             let input = inputs[i].clamp(0.0, 1.0);
@@ -756,7 +969,13 @@ impl AudioProcessor {
                     DecayMode::Gravity => {
                         let g = 2.0 / (decay_s * decay_s) * s.gravity_coefficient.max(0.01);
                         self.bar_velocities[i] += g * dt;
-                        (prev - self.bar_velocities[i] * dt).max(input)
+                        let next = prev - self.bar_velocities[i] * dt;
+                        if next <= input {
+                            self.bar_velocities[i] = 0.0; // fix #4
+                            input
+                        } else {
+                            next
+                        }
                     }
                 };
             }
@@ -782,7 +1001,6 @@ impl AudioProcessor {
         let nyquist = n_fft / 2;
         let bin_width = self.sample_rate / n_fft as f32;
 
-        // Band edges as bin indices (bass < 250 Hz <= mid < 4 kHz <= treble).
         let bass_end = ((250.0 / bin_width).ceil() as usize).clamp(1, nyquist);
         let mid_end = ((4000.0 / bin_width).ceil() as usize).clamp(bass_end, nyquist);
         let (lo, hi) = match s.beat_focus {
@@ -790,36 +1008,42 @@ impl AudioProcessor {
             BeatFocusMode::Mid => (bass_end, mid_end),
             BeatFocusMode::Treble => (mid_end, nyquist),
         };
-        // Only the focused band is summed (was: the whole spectrum, every frame).
         let energy: f32 = self.output_buffer[lo..hi.max(lo)].iter().map(|c| c.norm()).sum();
 
-        // ~1.5 s sliding window of band energy.
         let hist_len = (s.poll_rate_hz * 1.5).max(30.0) as usize;
         while self.beat_energy_history.len() >= hist_len {
             self.beat_energy_history.pop_front();
         }
         self.beat_energy_history.push_back(energy);
-        // Exact sum (<= a few hundred entries): no f32 drift like a running sum.
-        self.beat_energy_sum = self.beat_energy_history.iter().sum();
-        let local_avg = self.beat_energy_sum / self.beat_energy_history.len() as f32;
+
+        // Require ~0.5 s of history before arming (fix: avoid startup false-triggers)
+        let min_hist = (s.poll_rate_hz * 0.5).max(15.0) as usize;
+        if self.beat_energy_history.len() < min_hist {
+            // still decay envelope, still advance phase
+            let is_beat = false;
+            if self.beat_envelope > 0.0 {
+                let tau = (s.beat_envelope_decay_ms / 1000.0).max(0.001);
+                self.beat_envelope *= (-dt / tau).exp();
+                if self.beat_envelope < 0.001 { self.beat_envelope = 0.0; }
+            }
+            let period_s = if self.bpm > 20.0 { 60.0 / self.bpm } else { 0.5 };
+            self.phase = (self.phase + dt / period_s).rem_euclid(1.0);
+            return (is_beat, self.phase);
+        }
+
+        let local_avg = self.beat_energy_history.iter().sum::<f32>()
+            / self.beat_energy_history.len() as f32;
 
         let sensitivity = s.beat_detection_sensitivity.clamp(0.0, 1.0);
-        let threshold =
-            local_avg * s.energy_threshold_multiplier.max(1.0) * (1.0 - sensitivity * 0.5);
+        let threshold = local_avg * s.energy_threshold_multiplier.max(1.0)
+            * (1.0 - sensitivity * 0.5);
         let above = energy > threshold && energy > local_avg * 1.05;
 
-        // Hysteresis: re-arm only after the energy has dropped back down.
-        if energy < threshold * 0.9 {
-            self.beat_armed = true;
-        }
+        if energy < threshold * 0.9 { self.beat_armed = true; }
         let since_last = self.time_elapsed
             - self.beat_times.back().copied().unwrap_or(f64::NEG_INFINITY);
         let is_beat = above && self.beat_armed && since_last > MIN_BEAT_GAP_S;
-        if above {
-            // Consume the crossing, even if the lockout rejected it,
-            // so a sustained loud passage can't re-trigger later.
-            self.beat_armed = false;
-        }
+        if above { self.beat_armed = false; }
 
         if is_beat {
             self.beat_times.push_back(self.time_elapsed);
@@ -829,13 +1053,10 @@ impl AudioProcessor {
             self.recompute_bpm();
         }
 
-        // Expire stale beats / stale tempo.
         while let Some(&t) = self.beat_times.front() {
             if self.time_elapsed - t > BEAT_MEMORY_S {
                 self.beat_times.pop_front();
-            } else {
-                break;
-            }
+            } else { break; }
         }
         if let Some(&last) = self.beat_times.back() {
             if self.time_elapsed - last > BEAT_TIMEOUT_S {
@@ -849,9 +1070,7 @@ impl AudioProcessor {
         } else if self.beat_envelope > 0.0 {
             let tau = (s.beat_envelope_decay_ms / 1000.0).max(0.001);
             self.beat_envelope *= (-dt / tau).exp();
-            if self.beat_envelope < 0.001 {
-                self.beat_envelope = 0.0;
-            }
+            if self.beat_envelope < 0.001 { self.beat_envelope = 0.0; }
         }
 
         let period_s = if self.bpm > 20.0 { 60.0 / self.bpm } else { 0.5 };
@@ -867,15 +1086,10 @@ impl AudioProcessor {
     }
 
     fn recompute_bpm(&mut self) {
-        // Need at least 2 intervals (3 beats) before trusting anything.
-        if self.beat_times.len() < 3 {
-            return;
-        }
+        if self.beat_times.len() < 3 { return; }
         let min_iv = 60.0 / BPM_FOLD_MAX;
         let max_iv = 60.0 / BPM_FOLD_MIN;
 
-        // Fold every interval into [min_iv, max_iv]: a missed beat (2x) or a
-        // double trigger (0.5x) then votes for the same tempo as a normal one.
         let mut iv: Vec<f64> = self
             .beat_times
             .iter()
@@ -888,40 +1102,40 @@ impl AudioProcessor {
                 d
             })
             .collect();
-        if iv.len() < 2 {
-            return;
-        }
+        if iv.len() < 2 { return; }
         iv.sort_by(|a, b| a.total_cmp(b));
         let median = iv[iv.len() / 2];
 
-        // Average only the intervals that agree with the median (reject outliers).
         let (sum, n) = iv
             .iter()
             .filter(|d| (**d - median).abs() <= median * 0.12)
             .fold((0.0f64, 0usize), |(s, n), d| (s + d, n + 1));
-        if n == 0 {
-            return;
-        }
+        if n == 0 { return; }
         let new_bpm = (60.0 / (sum / n as f64)) as f32;
 
         if self.bpm <= 0.0 || (new_bpm - self.bpm).abs() / self.bpm > 0.12 {
-            self.bpm = new_bpm; // first estimate or genuine tempo change: jump
+            self.bpm = new_bpm;
         } else {
-            self.bpm += (new_bpm - self.bpm) * 0.3; // otherwise smooth the jitter
+            self.bpm += (new_bpm - self.bpm) * 0.3;
         }
     }
 }
 
 // ─────────────────────────────────────────────────────────────
-// Helpers (unchanged)
+// Helpers
 // ─────────────────────────────────────────────────────────────
+
+fn compute_window_gain(window: &[f32]) -> f32 {
+    let sum: f32 = window.iter().sum();
+    if sum > 1e-9 { 2.0 / sum } else { 2.0 / window.len().max(1) as f32 }
+}
 
 fn make_window(kind: WindowFunction, n: usize) -> Vec<f32> {
     let mut w = vec![0.0f32; n];
-    let denom = n.saturating_sub(1).max(1) as f32;
+    let n_f = n.max(1) as f32; // periodic form (more correct for FFT analysis)
     let two_pi = 2.0 * std::f32::consts::PI;
     for (i, x) in w.iter_mut().enumerate() {
-        let t = i as f32 / denom;
+        let t = i as f32 / n_f;
         *x = match kind {
             WindowFunction::Hann => 0.5 * (1.0 - (two_pi * t).cos()),
             WindowFunction::Hamming => 0.54 - 0.46 * (two_pi * t).cos(),
@@ -952,15 +1166,21 @@ fn make_bin_ranges(
 ) -> Vec<(usize, usize)> {
     let nyquist = fft_size / 2;
     let bin_width = sample_rate / fft_size as f32;
+    let nyquist_hz = bin_width * nyquist as f32;
+    let min_freq = min_freq.clamp(bin_width, nyquist_hz - bin_width);
+    let max_freq = max_freq.clamp(min_freq + bin_width, nyquist_hz);
     let min_bin = ((min_freq / bin_width).floor() as usize).max(1);
-    let max_bin = ((max_freq / bin_width).ceil() as usize).min(nyquist);
+    let max_bin = ((max_freq / bin_width).ceil() as usize)
+        .min(nyquist)
+        .max(min_bin + 1);
 
     let mut ranges = Vec::with_capacity(num_bars);
     match scaling {
         FrequencyScaling::Linear => {
+            let span = max_bin.saturating_sub(min_bin);
             for i in 0..num_bars {
-                let s = min_bin + (i * (max_bin - min_bin)) / num_bars;
-                let e = min_bin + ((i + 1) * (max_bin - min_bin)) / num_bars;
+                let s = min_bin + (i * span) / num_bars;
+                let e = min_bin + ((i + 1) * span) / num_bars;
                 ranges.push((s, e.max(s + 1).min(nyquist)));
             }
         }
@@ -979,12 +1199,33 @@ fn make_bin_ranges(
     ranges
 }
 
-fn centers_from_ranges(ranges: &[(usize, usize)], fft_size: usize, sample_rate: f32) -> Vec<f32> {
-    let bin_width = sample_rate / fft_size as f32;
-    ranges.iter().map(|(s, e)| {
-        let center = (*s + *e) as f32 * 0.5;
-        (center * bin_width).max(20.0)
+/// Bar centre frequencies, computed directly from the requested frequency bounds
+/// (not from rounded bin indices). The geometric/arithmetic mean matters most
+/// for the low bands, where multiple bars fall inside the same FFT bin.
+fn compute_bar_centers_hz(
+    num_bars: usize,
+    scaling: FrequencyScaling,
+    min_freq: f32,
+    max_freq: f32,
+) -> Vec<f32> {
+    if num_bars == 0 || max_freq <= min_freq { return Vec::new(); }
+    let ratio = (max_freq / min_freq).powf(1.0 / num_bars as f32);
+    (0..num_bars).map(|i| {
+        match scaling {
+            FrequencyScaling::Linear => {
+                let step = (max_freq - min_freq) / num_bars as f32;
+                (min_freq + (i as f32 + 0.5) * step).max(20.0)
+            }
+            FrequencyScaling::Logarithmic => {
+                (min_freq * ratio.powf(i as f32 + 0.5)).max(20.0)
+            }
+        }
     }).collect()
+}
+
+fn smoothstep(x: f32, a: f32, b: f32) -> f32 {
+    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 fn a_weighting_db(f: f32) -> f32 {
@@ -998,9 +1239,38 @@ fn a_weighting_db(f: f32) -> f32 {
     20.0 * ra.log10() + 2.0
 }
 
+/// Evaluate a biquad's magnitude response at frequency `f` (Hz), assuming the
+/// coefficients were designed for `fs`. Returns dB.
+fn biquad_db(f: f32, fs: f32, b: [f32; 3], a: [f32; 3]) -> f32 {
+    let w = 2.0 * std::f32::consts::PI * f / fs;
+    let (c1, s1) = (w.cos(), w.sin());
+    let (c2, s2) = ((2.0 * w).cos(), (2.0 * w).sin());
+    let nr = b[0] + b[1] * c1 + b[2] * c2;
+    let ni = -(b[1] * s1 + b[2] * s2);
+    let dr = a[0] + a[1] * c1 + a[2] * c2;
+    let di = -(a[1] * s1 + a[2] * s2);
+    let num = nr * nr + ni * ni;
+    let den = dr * dr + di * di;
+    if den < 1e-20 { return 0.0; }
+    10.0 * (num / den).log10()
+}
+
+/// ITU-R BS.1770 K-weighting (48 kHz coefficients). For non-48 kHz playback
+/// the *filter* shape is correct for 48 kHz; using it at another rate is
+/// a small approximation that is fine for visualization purposes.
 fn k_weighting_db(f: f32) -> f32 {
-    let f = f.max(10.0);
-    let shelf = 4.0 * (1.0 - 1.0 / (1.0 + (f / 1500.0).powi(4)));
-    let hp = -0.5 * (f / 60.0).powi(2) / (1.0 + (f / 60.0).powi(2));
+    const FS: f32 = 48_000.0;
+    // Stage 1: high-shelf
+    let shelf = biquad_db(
+        f, FS,
+        [1.535_124_86, -2.691_696_19, 1.198_392_81],
+        [1.0, -1.690_659_29, 0.732_480_77],
+    );
+    // Stage 2: high-pass
+    let hp = biquad_db(
+        f, FS,
+        [1.0, -2.0, 1.0],
+        [1.0, -1.990_047_45, 0.990_072_25],
+    );
     shelf + hp
 }
