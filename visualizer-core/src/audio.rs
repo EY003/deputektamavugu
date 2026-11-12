@@ -58,8 +58,8 @@ impl AudioEngine {
         let (ctrl_tx, ctrl_rx) = crossbeam_channel::unbounded::<ControlMsg>();
         let (info_tx, info_rx) = crossbeam_channel::bounded(1);
 
-        let sample_rate_shared = Arc::new(AtomicU32::new(48_000u32.to_bits()));
-
+        let sample_rate_shared = Arc::new(AtomicU32::new(48_000f32.to_bits()));
+        
         let settings_for_capture = settings.clone();
         let stop_cap = stop.clone();
         let sr_cap = sample_rate_shared.clone();
@@ -269,11 +269,11 @@ fn capture_session(
             };
             if frames_read == 0 { break; }
 
-            if flags.contains(BufferFlags::DATA_DISCONTINUITY) {
+            if flags.is_data_discontinuity() {
                 let _ = ctrl_tx.try_send(ControlMsg::ResetDcBlocker);
             }
-            if flags.contains(BufferFlags::SILENT) {
-                sample_buffer[..needed].fill(0.0);
+            if flags.is_silent() {
+               sample_buffer[..needed].fill(0.0);
             }
 
             let valid_samples = (frames_read as usize * samples_per_frame).min(sample_buffer.len());
