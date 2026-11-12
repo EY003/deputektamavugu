@@ -300,6 +300,66 @@ impl PaletteCache {
     }
 }
 
+// ─── Patch 7a: palette worker (off-thread extraction) ───────────
+
+#[derive(Clone, Copy, PartialEq)]
+struct PaletteKey {
+    slot: u8, // 0 = static single, 1 = static multi, 2 = gradient, 3 = animated
+    track_id: u64,
+    size: u8,
+    variants: u8,
+    priority: PalettePriority,
+}
+
+struct PaletteJob {
+    key: PaletteKey,
+    image: Arc<DynamicImage>,
+}
+
+struct PaletteResult {
+    key: PaletteKey,
+    colors: Vec<[u8; 3]>,
+}
+
+struct PaletteWorker {
+    tx: crossbeam_channel::Sender<PaletteJob>,
+    rx: crossbeam_channel::Receiver<PaletteResult>,
+    pending: [Option<PaletteKey>; 4],
+}
+
+impl PaletteWorker {
+    fn new(ctx: egui::Context) -> Self {
+        let (job_tx, job_rx) = crossbeam_channel::unbounded::<PaletteJob>();
+        let (res_tx, res_rx) = crossbeam_channel::unbounded::<PaletteResult>();
+        let _ = std::thread::Builder::new()
+            .name("palette-worker".into())
+            .spawn(move || {
+                while let Ok(first) = job_rx.recv() {
+                    // Coalesce: while sliders are dragged only the newest job per slot matters.
+                    let mut latest: [Option<PaletteJob>; 4] = Default::default();
+                    latest[first.key.slot as usize] = Some(first);
+                    while let Ok(j) = job_rx.try_recv() {
+                        let s = j.key.slot as usize;
+                        latest[s] = Some(j);
+                    }
+                    for job in latest.into_iter().flatten() {
+                        let colors = color::extract_palette(
+                            &job.image,
+                            job.key.size,
+                            job.key.variants,
+                            job.key.priority,
+                        );
+                        if res_tx.send(PaletteResult { key: job.key, colors }).is_err() {
+                            return;
+                        }
+                        ctx.request_repaint();
+                    }
+                }
+            });
+        Self { tx: job_tx, rx: res_rx, pending: [None; 4] }
+    }
+}
+
 #[derive(Default, Clone)]
 struct ActivePalettes {
     static_single_colors: Vec<[u8; 3]>,
@@ -696,13 +756,14 @@ struct VisualizerApp {
     track_rx: crossbeam_channel::Receiver<TrackInfo>,
     track_info: Option<TrackInfo>,
     cover_texture: Option<egui::TextureHandle>,
-    cover_image: Option<DynamicImage>,
+    cover_image: Option<Arc<DynamicImage>>,
     track_id: u64,
     active_palettes: ActivePalettes,
     static_single_cache: PaletteCache,
     static_multi_cache: PaletteCache,
     gradient_cache: PaletteCache,
     animated_cache: PaletteCache,
+    palette_worker: PaletteWorker,
     last_palette_hash: u64,
     loaded_font_path: Option<String>,
     smtc_session_count: Arc<AtomicUsize>,
@@ -844,6 +905,7 @@ impl VisualizerApp {
             static_multi_cache: PaletteCache::default(),
             gradient_cache: PaletteCache::default(),
             animated_cache: PaletteCache::default(),
+            palette_worker: PaletteWorker::new(ctx.clone()),
             last_palette_hash: 0,
             loaded_font_path: Some("__init__".to_string()),
             smtc_session_count,
@@ -1015,26 +1077,71 @@ impl VisualizerApp {
         }
     }
 
+    // ─── Patch 7c: palette accessors go through the worker ─────────
+
+    fn palette_slot_cache(&mut self, slot: u8) -> &mut PaletteCache {
+        match slot {
+            0 => &mut self.static_single_cache,
+            1 => &mut self.static_multi_cache,
+            2 => &mut self.gradient_cache,
+            _ => &mut self.animated_cache,
+        }
+    }
+
+    /// Cache hit -> colours now. Miss -> queue a background job and return `fallback`
+    /// (the previously active colours) so the UI thread never blocks.
+    fn resolve_palette(
+        &mut self,
+        slot: u8,
+        size: u8,
+        variants: u8,
+        priority: PalettePriority,
+        fallback: &[[u8; 3]],
+    ) -> Vec<[u8; 3]> {
+        let tid = self.track_id;
+        if let Some(c) = self.palette_slot_cache(slot).get(tid, size, variants, priority) {
+            return c.to_vec();
+        }
+        let Some(img) = self.cover_image.clone() else {
+            let white = vec![[255, 255, 255]];
+            self.palette_slot_cache(slot).store(tid, size, variants, priority, white.clone());
+            return white;
+        };
+        let key = PaletteKey { slot, track_id: tid, size, variants, priority };
+        if self.palette_worker.pending[slot as usize] != Some(key) {
+            self.palette_worker.pending[slot as usize] = Some(key);
+            let _ = self.palette_worker.tx.send(PaletteJob { key, image: img });
+        }
+        if fallback.is_empty() { vec![[255, 255, 255]] } else { fallback.to_vec() }
+    }
+
+    /// Collect finished jobs into the caches. Returns true if anything arrived.
+    fn poll_palette_results(&mut self) -> bool {
+        let mut any = false;
+        while let Ok(r) = self.palette_worker.rx.try_recv() {
+            let k = r.key;
+            let slot = k.slot as usize;
+            if self.palette_worker.pending[slot] == Some(k) {
+                self.palette_worker.pending[slot] = None;
+            }
+            if k.track_id != self.track_id {
+                continue; // result for a previous track
+            }
+            self.palette_slot_cache(k.slot)
+                .store(k.track_id, k.size, k.variants, k.priority, r.colors);
+            any = true;
+        }
+        any
+    }
+
     fn update_static_single_palette(&mut self) {
         let colors = match self.config.static_single_source.clone() {
             ColorSource::Static(colors) => {
                 vec![colors.first().copied().unwrap_or([255, 255, 255])]
             }
             ColorSource::Dynamic { priority, .. } => {
-                let tid = self.track_id;
-                self.static_single_cache
-                    .get(tid, 1, 0, priority)
-                    .map(|s| s.to_vec())
-                    .unwrap_or_else(|| {
-                        let extracted = self
-                            .cover_image
-                            .as_ref()
-                            .map(|img| color::extract_palette(img, 1, 0, priority))
-                            .unwrap_or_else(|| vec![[255, 255, 255]]);
-                        self.static_single_cache
-                            .store(tid, 1, 0, priority, extracted.clone());
-                        extracted
-                    })
+                let fb = self.active_palettes.static_single_colors.clone();
+                self.resolve_palette(0, 1, 0, priority, &fb)
             }
         };
         self.active_palettes.static_single_colors = colors;
@@ -1046,27 +1153,8 @@ impl VisualizerApp {
                 if colors.is_empty() { vec![[255, 255, 255]] } else { colors }
             }
             ColorSource::Dynamic { palette_size, variants_per_color, priority } => {
-                let tid = self.track_id;
-                self.static_multi_cache
-                    .get(tid, palette_size, variants_per_color, priority)
-                    .map(|s| s.to_vec())
-                    .unwrap_or_else(|| {
-                        let extracted = self
-                            .cover_image
-                            .as_ref()
-                            .map(|img| {
-                                color::extract_palette(img, palette_size, variants_per_color, priority)
-                            })
-                            .unwrap_or_else(|| vec![[255, 255, 255]]);
-                        self.static_multi_cache.store(
-                            tid,
-                            palette_size,
-                            variants_per_color,
-                            priority,
-                            extracted.clone(),
-                        );
-                        extracted
-                    })
+                let fb = self.active_palettes.static_multi_colors.clone();
+                self.resolve_palette(1, palette_size, variants_per_color, priority, &fb)
             }
         };
         self.active_palettes.static_multi_colors = colors;
@@ -1076,27 +1164,8 @@ impl VisualizerApp {
         let colors = match self.config.gradient_source.clone() {
             GradientSource::Static(stops) => stops.iter().map(|s| s.color).collect::<Vec<_>>(),
             GradientSource::Dynamic { palette_size, variants_per_color, priority } => {
-                let tid = self.track_id;
-                self.gradient_cache
-                    .get(tid, palette_size, variants_per_color, priority)
-                    .map(|s| s.to_vec())
-                    .unwrap_or_else(|| {
-                        let extracted = self
-                            .cover_image
-                            .as_ref()
-                            .map(|img| {
-                                color::extract_palette(img, palette_size, variants_per_color, priority)
-                            })
-                            .unwrap_or_else(|| vec![[255, 255, 255]]);
-                        self.gradient_cache.store(
-                            tid,
-                            palette_size,
-                            variants_per_color,
-                            priority,
-                            extracted.clone(),
-                        );
-                        extracted
-                    })
+                let fb = self.active_palettes.gradient_colors.clone();
+                self.resolve_palette(2, palette_size, variants_per_color, priority, &fb)
             }
         };
         self.active_palettes.gradient_stops = match &self.config.gradient_source {
@@ -1112,27 +1181,8 @@ impl VisualizerApp {
                 if colors.is_empty() { vec![[255, 255, 255]] } else { colors }
             }
             ColorSource::Dynamic { palette_size, variants_per_color, priority } => {
-                let tid = self.track_id;
-                self.animated_cache
-                    .get(tid, palette_size, variants_per_color, priority)
-                    .map(|s| s.to_vec())
-                    .unwrap_or_else(|| {
-                        let extracted = self
-                            .cover_image
-                            .as_ref()
-                            .map(|img| {
-                                color::extract_palette(img, palette_size, variants_per_color, priority)
-                            })
-                            .unwrap_or_else(|| vec![[255, 255, 255]]);
-                        self.animated_cache.store(
-                            tid,
-                            palette_size,
-                            variants_per_color,
-                            priority,
-                            extracted.clone(),
-                        );
-                        extracted
-                    })
+                let fb = self.active_palettes.animated_colors.clone();
+                self.resolve_palette(3, palette_size, variants_per_color, priority, &fb)
             }
         };
         self.active_palettes.animated_colors = colors;
@@ -1150,27 +1200,52 @@ impl VisualizerApp {
         h.finish()
     }
 
+    // ─── Patch 7d: direct decode, no palette extraction on UI thread ───
+
     fn poll_track_updates(&mut self, ctx: &egui::Context) {
         while let Ok(info) = self.track_rx.try_recv() {
-            if let Some(bytes) = &info.cover_art {
-                if let Some((colors, img)) = color::extract_colors_from_bytes(bytes) {
-                    let _ = colors.dominant;
-                    self.track_id = compute_track_id(Some(bytes), &info.artist, &info.title);
-                    let rgba = img.to_rgba8();
-                    let size = [rgba.width() as usize, rgba.height() as usize];
-                    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
-                    self.cover_texture = Some(ctx.load_texture(
-                        "cover_art",
-                        color_image,
-                        egui::TextureOptions::LINEAR,
-                    ));
-                    self.cover_image = Some(img);
+            let new_id = compute_track_id(info.cover_art.as_deref(), &info.artist, &info.title);
+
+            // SMTC often fires several identical updates per track change:
+            // skip the decode/upload when nothing actually changed.
+            let unchanged = new_id == self.track_id
+                && self.cover_texture.is_some() == info.cover_art.is_some();
+
+            if !unchanged {
+                let decoded = info
+                    .cover_art
+                    .as_ref()
+                    .and_then(|b| image::load_from_memory(b).ok());
+
+                match decoded {
+                    Some(img) => {
+                        self.track_id = new_id;
+                        // Texture never needs to be bigger than 512 px.
+                        let tex_src = if img.width().max(img.height()) > 512 {
+                            img.thumbnail(512, 512)
+                        } else {
+                            img
+                        };
+                        let rgba = tex_src.to_rgba8();
+                        let size = [rgba.width() as usize, rgba.height() as usize];
+                        let color_image =
+                            egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+                        self.cover_texture = Some(ctx.load_texture(
+                            "cover_art",
+                            color_image,
+                            egui::TextureOptions::LINEAR,
+                        ));
+                        // Small copy for palette extraction (it thumbnails to 64 px anyway).
+                        self.cover_image = Some(Arc::new(tex_src.thumbnail(128, 128)));
+                    }
+                    None => {
+                        self.cover_texture = None;
+                        self.cover_image = None;
+                        self.track_id = new_id;
+                    }
                 }
-            } else {
-                self.cover_texture = None;
-                self.cover_image = None;
-                self.track_id = compute_track_id(None, &info.artist, &info.title);
             }
+
             if info.title.is_empty() && info.artist.is_empty() {
                 self.track_info = None;
             } else {
@@ -4539,9 +4614,10 @@ impl eframe::App for VisualizerApp {
         }
 
         self.poll_track_updates(ctx);
+        let palettes_ready = self.poll_palette_results();
 
         let new_hash = self.palette_fingerprint();
-        if new_hash != self.last_palette_hash {
+        if palettes_ready || new_hash != self.last_palette_hash {
             self.update_palettes();
             self.last_palette_hash = new_hash;
             let mut st = lock_state(&self.shared);
