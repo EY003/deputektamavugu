@@ -10,16 +10,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use visualizer_core::{
-    audio::{AudioEngine, BarFrame},
+    audio::{AudioEngine, AudioStats, BarFrame, Onsets},
     color,
     config::{
         self as cfg,
-        AppConfig, AudioPreset, BarInterpolation, BeatFocusMode, BlendMode, ChannelMixMode,
-        ColorChangePreset, ColorMode, ColorPreset, ColorSource, CustomAudioPreset, DecayMode,
-        FrequencyDirection, FrequencyScaling, GradientPreset, GradientSource, GradientStop,
-        MotionShape, PalettePriority, StaticDistributionMode, StaticMultiPreset,
-        TrackInfoConfig, TrackTextAlign, TrackTextColorMode, VerticalColorStyle,
-        VisualizerDirection, WeightingCurve, WindowFunction,
+        AppConfig, AudioPreset, BarInterpolation, BeatFocusMode, BlendMode, BpmMultiplier,
+        ChannelMixMode, ColorChangePreset, ColorMode, ColorPreset, ColorSource,
+        CustomAudioPreset, DecayMode, FrequencyDirection, FrequencyScaling, GradientPreset,
+        GradientSource, GradientStop, MotionShape, PalettePriority, StaticDistributionMode,
+        StaticMultiPreset, TrackInfoConfig, TrackTextAlign, TrackTextColorMode,
+        VerticalColorStyle, VisualizerDirection, WeightingCurve, WindowFunction,
     },
     musicbee::{self, TrackInfo},
 };
@@ -300,11 +300,9 @@ impl PaletteCache {
     }
 }
 
-// ─── Patch 7a: palette worker (off-thread extraction) ───────────
-
 #[derive(Clone, Copy, PartialEq)]
 struct PaletteKey {
-    slot: u8, // 0 = static single, 1 = static multi, 2 = gradient, 3 = animated
+    slot: u8,
     track_id: u64,
     size: u8,
     variants: u8,
@@ -335,13 +333,12 @@ impl PaletteWorker {
             .name("palette-worker".into())
             .spawn(move || {
                while let Ok(first) = job_rx.recv() {
-    // Coalesce: while sliders are dragged only the newest job per slot matters.
     let mut latest: [Option<PaletteJob>; 4] = Default::default();
-    let slot = first.key.slot as usize;        // ← added
-    latest[slot] = Some(first);                // ← changed
+    let slot = first.key.slot as usize;
+    latest[slot] = Some(first);
     while let Ok(j) = job_rx.try_recv() {
         let s = j.key.slot as usize;
-        latest[s] = Some(j);                   // ← already fine (s is a plain usize)
+        latest[s] = Some(j);
     }
                     for job in latest.into_iter().flatten() {
                         let colors = color::extract_palette(
@@ -618,11 +615,11 @@ const SEARCH_INDEX: &[(SettingsTab, &str, &[&str])] = &[
     (SettingsTab::Audio, "Amplitude", &["sensitivity", "gain", "gamma", "noise", "agc"]),
     (SettingsTab::Audio, "Equalizer", &["eq", "bass", "mid", "treble", "tilt"]),
     (SettingsTab::Audio, "Ballistics", &["attack", "decay", "gravity", "peak"]),
-    (SettingsTab::Audio, "Rhythm", &["beat", "bpm", "tempo", "phase"]),
+    (SettingsTab::Audio, "Rhythm", &["beat", "bpm", "tempo", "phase", "tap", "chroma", "latency"]),
     (SettingsTab::TrackInfo, "Cover Art", &["cover", "art", "album"]),
     (SettingsTab::TrackInfo, "Text", &["title", "artist", "font", "text", "shadow", "outline"]),
     (SettingsTab::Display, "Background", &["background", "bg", "opacity"]),
-    (SettingsTab::Display, "Menu & Display", &["scale", "size", "help", "launch", "fps", "vsync", "frame"]),
+    (SettingsTab::Display, "Menu & Display", &["scale", "size", "help", "launch", "fps", "vsync", "frame", "diagnostics"]),
 ];
 
 // ═══════════════════════════════════════════════════════════════
@@ -646,8 +643,6 @@ impl MeshBuilder {
         }
     }
 
-    /// Start a new frame. `take_mesh` moved the buffers out, so re-reserve
-    /// based on last frame's size (+12 % headroom) to avoid regrowth.
     fn reset(&mut self) {
         self.vertices.clear();
         self.indices.clear();
@@ -685,7 +680,6 @@ impl MeshBuilder {
         self.indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
 
-    /// Moves the buffers into an `egui::Mesh` (no copy).
     fn take_mesh(&mut self) -> egui::Mesh {
         self.last_v = self.vertices.len();
         self.last_i = self.indices.len();
@@ -750,6 +744,22 @@ struct VisualizerApp {
     last_bpm: f32,
     audio_rx: crossbeam_channel::Receiver<BarFrame>,
     audio_settings: Arc<ArcSwap<visualizer_core::config::AudioSettings>>,
+    audio_stats: Arc<AudioStats>,
+    audio_device_name: String,
+    tap_tx: crossbeam_channel::Sender<Instant>,
+
+    // Two-frame interpolation state (feature 23)
+    prev_frame: Option<BarFrame>,
+    next_frame: Option<BarFrame>,
+    last_onsets: Onsets,
+    last_rms: f32,
+    last_peak: f32,
+    last_band_levels: [f32; 4],
+    last_chroma: [f32; 12],
+    last_dominant_pitch_hz: f32,
+    last_beat_in: f32,
+    last_capture_instant: Instant,
+
     should_quit: Arc<AtomicBool>,
     current_fps: f32,
     is_passthrough_set: bool,
@@ -800,6 +810,9 @@ impl VisualizerApp {
         let should_quit = Arc::new(AtomicBool::new(false));
         musicbee::log_smtc("APP: Initializing VisualizerApp.");
         let audio_settings = engine.settings.clone();
+        let audio_stats = engine.stats.clone();
+        let audio_device_name = engine.device_name.clone();
+        let tap_tx = engine.tap_sender();
 
         let (track_tx, track_rx) = crossbeam_channel::unbounded();
         let smtc_session_count = Arc::new(AtomicUsize::new(0));
@@ -825,8 +838,14 @@ impl VisualizerApp {
             .unwrap();
 
         let hotkey_manager = GlobalHotKeyManager::new().unwrap();
-        let hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyV);
-        hotkey_manager.register(hotkey).unwrap();
+        let toggle_hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyV);
+        let toggle_hotkey_id = toggle_hotkey.id();
+        hotkey_manager.register(toggle_hotkey).unwrap();
+
+        let tap_hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyT);
+        let tap_hotkey_id = tap_hotkey.id();
+        // Register the tap hotkey; if it fails, don't abort — the UI button still works.
+        let _ = hotkey_manager.register(tap_hotkey);
 
         let (ui_cmd_tx, ui_cmd_rx) = crossbeam_channel::unbounded::<UiCmd>();
         {
@@ -854,12 +873,17 @@ impl VisualizerApp {
         {
             let tx = ui_cmd_tx.clone();
             let wake = ctx.clone();
+            let tap_tx_clone = tap_tx.clone();
             std::thread::spawn(move || {
                 let rx = GlobalHotKeyEvent::receiver();
                 while let Ok(event) = rx.recv() {
                     if event.state == global_hotkey::HotKeyState::Pressed {
-                        let _ = tx.send(UiCmd::ToggleSettings);
-                        wake.request_repaint();
+                        if event.id == tap_hotkey_id {
+                            let _ = tap_tx_clone.try_send(Instant::now());
+                        } else if event.id == toggle_hotkey_id {
+                            let _ = tx.send(UiCmd::ToggleSettings);
+                            wake.request_repaint();
+                        }
                     }
                 }
             });
@@ -891,6 +915,19 @@ impl VisualizerApp {
             last_bpm: 0.0,
             audio_rx: engine.frame_rx,
             audio_settings,
+            audio_stats,
+            audio_device_name,
+            tap_tx,
+            prev_frame: None,
+            next_frame: None,
+            last_onsets: Onsets { kick: false, snare: false, hat: false, flux: 0.0 },
+            last_rms: 0.0,
+            last_peak: 0.0,
+            last_band_levels: [0.0; 4],
+            last_chroma: [0.0; 12],
+            last_dominant_pitch_hz: 0.0,
+            last_beat_in: 0.0,
+            last_capture_instant: Instant::now(),
             config,
             should_quit,
             current_fps: 0.0,
@@ -1018,7 +1055,7 @@ impl VisualizerApp {
                 if show_art {
                     text_y += art_size + 14.0;
                 }
-                
+
                 let info = self.track_info.as_ref().unwrap();
                 let family = if cfg.font_path.is_some() { custom_font_family() } else { egui::FontFamily::Proportional };
                 let artist_font = egui::FontId::new(cfg.artist_font_size, family.clone());
@@ -1078,8 +1115,6 @@ impl VisualizerApp {
         }
     }
 
-    // ─── Patch 7c: palette accessors go through the worker ─────────
-
     fn palette_slot_cache(&mut self, slot: u8) -> &mut PaletteCache {
         match slot {
             0 => &mut self.static_single_cache,
@@ -1089,8 +1124,6 @@ impl VisualizerApp {
         }
     }
 
-    /// Cache hit -> colours now. Miss -> queue a background job and return `fallback`
-    /// (the previously active colours) so the UI thread never blocks.
     fn resolve_palette(
         &mut self,
         slot: u8,
@@ -1116,7 +1149,6 @@ impl VisualizerApp {
         if fallback.is_empty() { vec![[255, 255, 255]] } else { fallback.to_vec() }
     }
 
-    /// Collect finished jobs into the caches. Returns true if anything arrived.
     fn poll_palette_results(&mut self) -> bool {
         let mut any = false;
         while let Ok(r) = self.palette_worker.rx.try_recv() {
@@ -1126,7 +1158,7 @@ impl VisualizerApp {
                 self.palette_worker.pending[slot] = None;
             }
             if k.track_id != self.track_id {
-                continue; // result for a previous track
+                continue;
             }
             self.palette_slot_cache(k.slot)
                 .store(k.track_id, k.size, k.variants, k.priority, r.colors);
@@ -1201,14 +1233,10 @@ impl VisualizerApp {
         h.finish()
     }
 
-    // ─── Patch 7d: direct decode, no palette extraction on UI thread ───
-
     fn poll_track_updates(&mut self, ctx: &egui::Context) {
         while let Ok(info) = self.track_rx.try_recv() {
             let new_id = compute_track_id(info.cover_art.as_deref(), &info.artist, &info.title);
 
-            // SMTC often fires several identical updates per track change:
-            // skip the decode/upload when nothing actually changed.
             let unchanged = new_id == self.track_id
                 && self.cover_texture.is_some() == info.cover_art.is_some();
 
@@ -1221,7 +1249,6 @@ impl VisualizerApp {
                 match decoded {
                     Some(img) => {
                         self.track_id = new_id;
-                        // Texture never needs to be bigger than 512 px.
                         let tex_src = if img.width().max(img.height()) > 512 {
                             img.thumbnail(512, 512)
                         } else {
@@ -1236,7 +1263,6 @@ impl VisualizerApp {
                             color_image,
                             egui::TextureOptions::LINEAR,
                         ));
-                        // Small copy for palette extraction (it thumbnails to 64 px anyway).
                         self.cover_image = Some(Arc::new(tex_src.thumbnail(128, 128)));
                     }
                     None => {
@@ -1659,7 +1685,6 @@ impl VisualizerApp {
         if text.is_empty() {
             return;
         }
-        // Layout happens ONCE; every shadow/outline layer only re-paints the galleys.
         let laid = layout_spaced(ctx, text, font_id, align, cfg.letter_spacing);
 
         if cfg.shadow_enabled {
@@ -1691,7 +1716,6 @@ impl VisualizerApp {
                 cfg.opacity,
             );
             let t = cfg.outline_thickness;
-            // Thin outlines don't need 12 samples; thick ones do.
             let n = if t <= 2.0 { 8 } else { 12 };
             for i in 0..n {
                 let a = i as f32 / n as f32 * TAU;
@@ -2220,15 +2244,10 @@ impl VisualizerApp {
             return;
         }
 
-        // One interpolation step per ~2 px of bar pitch (max 6, the old value).
-        // For stride >= 12 px this is identical to before; for narrower bars the
-        // extra steps were sub-pixel and invisible.
         const PX_PER_STEP: f32 = 2.0;
-        // Quads whose both ends are shorter than this have no visible area.
         const MIN_VISIBLE_LEN: f32 = 0.05;
         let steps = ((stride / PX_PER_STEP).ceil() as usize).clamp(1, 6);
 
-        // Per-step constants, computed once instead of once per bar pair.
         let step_tab: Vec<(f32, f32, f32, f32)> = (0..steps)
             .map(|s| {
                 let t1 = s as f32 / steps as f32;
@@ -2241,7 +2260,6 @@ impl VisualizerApp {
             let is_static_multi = self.config.color_mode == ColorMode::StaticMultiple;
             let blocks = self.config.vertical_color_style == VerticalColorStyle::Blocks;
 
-            // Per-segment constants (same expressions as before => identical floats).
             let seg_tab: Vec<(f32, f32, f32)> = (0..n_segments)
                 .map(|k| {
                     let t_bot = k as f32 / n_segments as f32;
@@ -2250,7 +2268,6 @@ impl VisualizerApp {
                 })
                 .collect();
 
-            // StaticMultiple vertical colours depend only on the segment: compute once.
             let seg_colors: Vec<egui::Color32> = if is_static_multi {
                 seg_tab
                     .iter()
@@ -2281,7 +2298,6 @@ impl VisualizerApp {
                     let len1 = a.len + (b.len - a.len) * ts1;
                     let len2 = a.len + (b.len - a.len) * ts2;
 
-                    // x_norm is the same for every segment of this step: hoisted out of the k loop.
                     let x_norm = if is_static_multi {
                         0.0
                     } else {
@@ -2329,7 +2345,6 @@ impl VisualizerApp {
                 }
             }
 
-            // Edge caps (unchanged).
             let first = &bars[0];
             let edge_perp = first.perp - bar_width / 2.0;
             let pt = bar_vertex(dir, first.perp, anchor, first.len, 1.0);
@@ -2350,13 +2365,11 @@ impl VisualizerApp {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// LaidText / shadow / outline text rendering (patch 4)
+// LaidText / shadow / outline text rendering
 // ═══════════════════════════════════════════════════════════════
 
 const SHADOW_SAMPLES: usize = 8;
 
-/// Text laid out once: one galley (no letter spacing) or one galley per
-/// character (letter spacing), each with an offset relative to the anchor.
 struct LaidText {
     parts: Vec<(Arc<egui::Galley>, egui::Vec2)>,
 }
@@ -3554,7 +3567,7 @@ impl SettingsState {
             "Frequency Scaling",
             "freq_scaling",
             160.0,
-            &[FrequencyScaling::Linear, FrequencyScaling::Logarithmic],
+            &FrequencyScaling::all(),
             FrequencyScaling::display_name,
         );
         help_text(ui, show_help, a.frequency_scaling.description());
@@ -3862,10 +3875,15 @@ impl SettingsState {
         );
         slider_f32(
             ui,
-            &mut a.energy_threshold_multiplier,
+            &mut a.onset_threshold_multiplier,
             1.0..=3.0,
-            "Energy Threshold Multiplier",
+            "Onset Threshold Multiplier",
             DEFAULT_ENERGY_THRESHOLD,
+        );
+        help_text(
+            ui,
+            show_help,
+            "Higher = fewer onsets detected. Driven by spectral-flux ratio.",
         );
         slider_f32(
             ui,
@@ -3895,6 +3913,56 @@ impl SettingsState {
                 DEFAULT_BPM_PHASE_SMOOTHING,
             );
         }
+
+        section_header(ui, "Beat Clock");
+        combo_reset(
+            ui,
+            &mut a.bpm_multiplier,
+            BpmMultiplier::default(),
+            "BPM Multiplier",
+            "bpm_multiplier",
+            160.0,
+            &BpmMultiplier::all(),
+            BpmMultiplier::display_name,
+        );
+        help_text(ui, show_help, a.bpm_multiplier.description());
+
+        slider_f32(
+            ui,
+            &mut a.latency_offset_ms,
+            0.0..=200.0,
+            "Latency Offset (ms)",
+            default_latency_offset_ms(),
+        );
+        help_text(
+            ui,
+            show_help,
+            "Delays the visual beat to match what you hear. Only affects reported phase/beat_in.",
+        );
+
+        ui.horizontal(|ui| {
+            if ui.button("🎵 Tap Tempo (Ctrl+Shift+T)").clicked() {
+                let _ = self.tap_tx.try_send(Instant::now());
+            }
+            help_text(
+                ui,
+                show_help,
+                "Tap 3+ times within 3 s to override detection for 5 s.",
+            );
+        });
+
+        section_header(ui, "Chroma");
+        checkbox_reset(
+            ui,
+            &mut a.chroma_enabled,
+            "Enable Chroma / Dominant Pitch",
+            default_chroma_enabled(),
+        );
+        help_text(
+            ui,
+            show_help,
+            "Exposes 12-bin pitch-class histogram and dominant pitch per frame. Adds ~40 µs/frame.",
+        );
 
         let _ = &a;
         if self.last_bpm > 0.0 {
@@ -4064,7 +4132,6 @@ impl SettingsState {
 
         section_header(ui, "Song Info Text");
 
-        // Content
         ui.horizontal(|ui| {
             checkbox_reset(ui, &mut cfg.show_title, "Show Title", true);
             checkbox_reset(ui, &mut cfg.show_artist, "Show Artist", true);
@@ -4135,7 +4202,6 @@ impl SettingsState {
             }
         });
 
-        // Color
         ui.add_space(8.0);
         ui.label(
             egui::RichText::new("Color")
@@ -4155,7 +4221,6 @@ impl SettingsState {
         }
         slider_u8(ui, &mut cfg.opacity, "Text Opacity", 255);
 
-        // Layout
         ui.add_space(8.0);
         ui.label(
             egui::RichText::new("Layout")
@@ -4228,7 +4293,6 @@ impl SettingsState {
             });
         });
 
-        // Shadow
         ui.add_space(8.0);
         ui.label(
             egui::RichText::new("Shadow")
@@ -4243,7 +4307,6 @@ impl SettingsState {
             color_edit_reset(ui, &mut cfg.shadow_color, "Shadow Color", [0, 0, 0]);
         }
 
-        // Outline
         ui.add_space(8.0);
         ui.label(
             egui::RichText::new("Outline")
@@ -4309,6 +4372,13 @@ impl SettingsState {
             ui,
             self.config.show_help_text,
             "Shows the current frame rate in the top-left corner of the visualizer.",
+        );
+
+        checkbox_reset(ui, &mut self.config.show_diagnostics, "Show Diagnostics Overlay", false);
+        help_text(
+            ui,
+            self.config.show_help_text,
+            "Live capture/analysis stats, sample rate, dropped frames, BPM, onsets.",
         );
     }
 
@@ -4379,10 +4449,53 @@ fn fft_size_combo(ui: &mut egui::Ui, a: &mut visualizer_core::config::AudioSetti
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Settings panel + input routing (same window as the visualizer)
+// Diagnostics overlay (28)
 // ═══════════════════════════════════════════════════════════════
 
 impl VisualizerApp {
+    fn draw_diagnostics_window(&self, ctx: &egui::Context) {
+        let stats = &self.audio_stats;
+        let sr = f32::from_bits(stats.sample_rate_bits.load(Ordering::Relaxed));
+        egui::Window::new("Diagnostics")
+            .id(egui::Id::new("diag_window"))
+            .collapsible(true)
+            .resizable(true)
+            .default_pos(egui::pos2(20.0, 20.0))
+            .default_width(320.0)
+            .show(ctx, |ui| {
+                egui::Grid::new("diag_grid").num_columns(2).striped(true).show(ui, |ui| {
+                    ui.label("Device:"); ui.label(&self.audio_device_name); ui.end_row();
+                    ui.label("Sample rate:"); ui.label(format!("{:.0} Hz", sr)); ui.end_row();
+                    ui.label("Channels:"); ui.label(format!("{}", stats.channels.load(Ordering::Relaxed))); ui.end_row();
+                    ui.label("Bits/sample:"); ui.label(format!("{}", stats.bits_per_sample.load(Ordering::Relaxed))); ui.end_row();
+                    ui.label("FFT size:"); ui.label(format!("{}", stats.fft_size.load(Ordering::Relaxed))); ui.end_row();
+                    ui.label("Frames captured:"); ui.label(format!("{}", stats.frames_captured.load(Ordering::Relaxed))); ui.end_row();
+                    ui.label("Frames dropped:"); ui.label(format!("{}", stats.frames_dropped.load(Ordering::Relaxed))); ui.end_row();
+                    ui.label("Analysis time:"); ui.label(format!("{} µs", stats.analysis_time_us.load(Ordering::Relaxed))); ui.end_row();
+                    ui.label("Capture time:"); ui.label(format!("{} µs", stats.capture_time_us.load(Ordering::Relaxed))); ui.end_row();
+                    ui.label("Total onsets:"); ui.label(format!("{}", stats.onset_count.load(Ordering::Relaxed))); ui.end_row();
+                    ui.label("BPM:"); ui.label(format!("{:.1}", self.last_bpm)); ui.end_row();
+                    ui.label("Beat in:"); ui.label(format!("{:.3} s", self.last_beat_in)); ui.end_row();
+                    ui.label("Dominant pitch:"); ui.label(format!("{:.1} Hz", self.last_dominant_pitch_hz)); ui.end_row();
+                    ui.label("RMS / Peak:"); ui.label(format!("{:.4} / {:.4}", self.last_rms, self.last_peak)); ui.end_row();
+                    ui.label("Band levels:");
+                    ui.label(format!(
+                        "sub {:.2} · low {:.2} · mid {:.2} · high {:.2}",
+                        self.last_band_levels[0], self.last_band_levels[1],
+                        self.last_band_levels[2], self.last_band_levels[3],
+                    ));
+                    ui.end_row();
+                    ui.label("Onsets:");
+                    ui.label(format!(
+                        "kick {} · snare {} · hat {} · flux {:.2}",
+                        self.last_onsets.kick, self.last_onsets.snare,
+                        self.last_onsets.hat, self.last_onsets.flux,
+                    ));
+                    ui.end_row();
+                });
+            });
+    }
+
     fn ensure_overlay(&mut self, ctx: &egui::Context) {
         if self.overlay.is_some() || self.overlay_last_try.elapsed() < Duration::from_millis(250) {
             return;
@@ -4542,15 +4655,18 @@ impl VisualizerApp {
         }
     }
 
-    /// Decide whether another frame is needed.
-    /// - Audio moving      -> repaint continuously (vsync-paced).
-    /// - Silent, but the track text colour is animated -> ~30 fps is enough.
-    /// - Otherwise         -> sleep; the 500 ms heartbeat / input events wake us.
     fn schedule_repaint(&self, ctx: &egui::Context) {
         let has_audio = self.current_bars.iter().any(|&v| v > 0.0005)
-            || self.current_peaks.iter().any(|&v| v > 0.0005);
+            || self.current_peaks.iter().any(|&v| v > 0.0005)
+            || self.last_rms > 0.001
+            || (self.last_beat_in > 0.0 && self.last_beat_in < 0.5);
         if has_audio {
             ctx.request_repaint();
+            return;
+        }
+
+        if self.config.show_diagnostics {
+            ctx.request_repaint_after(Duration::from_millis(100));
             return;
         }
 
@@ -4636,15 +4752,54 @@ impl eframe::App for VisualizerApp {
             self.current_peaks.resize(n_bars, 0.0);
         }
 
-        let mut latest: Option<BarFrame> = None;
+        // ── Interpolate between the two most recent audio frames (feature 23) ──
         while let Ok(frame) = self.audio_rx.try_recv() {
-            latest = Some(frame);
+            self.prev_frame = self.next_frame.take();
+            self.next_frame = Some(frame);
         }
-        if let Some(frame) = latest {
-            let limit = self.current_bars.len().min(frame.values.len());
-            self.current_bars[..limit].copy_from_slice(&frame.values[..limit]);
-            self.current_peaks[..limit].copy_from_slice(&frame.peaks[..limit]);
-            self.last_bpm = frame.bpm;
+
+        let interp_now = Instant::now();
+        if let (Some(prev), Some(next)) = (&self.prev_frame, &self.next_frame) {
+            let elapsed = interp_now
+                .saturating_duration_since(prev.capture_instant)
+                .as_secs_f32();
+            let total = next.capture_instant
+                .saturating_duration_since(prev.capture_instant)
+                .as_secs_f32()
+                .max(0.001);
+            let alpha = (elapsed / total).clamp(0.0, 1.0);
+            let interp = prev.lerp_toward(next, alpha);
+            let limit = self.current_bars.len().min(interp.values.len());
+            self.current_bars[..limit].copy_from_slice(&interp.values[..limit]);
+            self.current_peaks[..limit].copy_from_slice(&interp.peaks[..limit]);
+            self.last_bpm = interp.bpm;
+            self.last_onsets = interp.onsets.clone();
+            self.last_rms = interp.rms;
+            self.last_peak = interp.peak;
+            self.last_band_levels = interp.band_levels;
+            self.last_chroma = interp.chroma;
+            self.last_dominant_pitch_hz = interp.dominant_pitch_hz;
+            self.last_capture_instant = interp.capture_instant;
+            let elapsed_since_next = interp_now
+                .saturating_duration_since(interp.capture_instant)
+                .as_secs_f32();
+            self.last_beat_in = interp.beat_in - elapsed_since_next;
+        } else if let Some(next) = &self.next_frame {
+            let limit = self.current_bars.len().min(next.values.len());
+            self.current_bars[..limit].copy_from_slice(&next.values[..limit]);
+            self.current_peaks[..limit].copy_from_slice(&next.peaks[..limit]);
+            self.last_bpm = next.bpm;
+            self.last_onsets = next.onsets.clone();
+            self.last_rms = next.rms;
+            self.last_peak = next.peak;
+            self.last_band_levels = next.band_levels;
+            self.last_chroma = next.chroma;
+            self.last_dominant_pitch_hz = next.dominant_pitch_hz;
+            self.last_capture_instant = next.capture_instant;
+            let elapsed_since_next = interp_now
+                .saturating_duration_since(next.capture_instant)
+                .as_secs_f32();
+            self.last_beat_in = next.beat_in - elapsed_since_next;
         }
 
         self.ensure_overlay(ctx);
@@ -4654,11 +4809,17 @@ impl eframe::App for VisualizerApp {
 
         let settings_open = self.settings_open.load(Ordering::Relaxed);
 
-        let vis_rect = self.compute_overlay_rect(ctx, monitor);
-        
-        // This is the crucial fix: lock the window to the monitor while settings are open.
-        // This prevents the window from moving when the user drags a slider that changes
-        // the visualizer's size or position, eliminating all slider glitching.
+        let mut vis_rect = self.compute_overlay_rect(ctx, monitor);
+
+        // Ensure diagnostics overlay fits inside the window.
+        if self.config.show_diagnostics {
+            let diag_rect = egui::Rect::from_min_size(
+                monitor.min + egui::vec2(10.0, 10.0),
+                egui::vec2(360.0, 360.0),
+            );
+            vis_rect = vis_rect.union(diag_rect);
+        }
+
         let target = if settings_open {
             egui::Rect::from_min_size(monitor.min, monitor.size() - egui::vec2(0.0, 1.0))
         } else {
@@ -4668,7 +4829,6 @@ impl eframe::App for VisualizerApp {
         let actual_pos = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min)).unwrap_or(egui::Pos2::ZERO);
         let actual_size = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size())).unwrap_or(egui::Vec2::ZERO);
 
-        // Send commands if the actual window differs from the target.
         if (actual_size - target.size()).length() > 1.0 || (actual_pos - target.min).length() > 1.0 {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target.size()));
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target.min));
@@ -4700,6 +4860,10 @@ impl eframe::App for VisualizerApp {
                 egui::FontId::monospace(16.0),
                 egui::Color32::GREEN,
             );
+        }
+
+        if self.config.show_diagnostics {
+            self.draw_diagnostics_window(ctx);
         }
 
         if settings_open {
