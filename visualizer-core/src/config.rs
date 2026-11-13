@@ -25,9 +25,6 @@ pub const DEFAULT_COVER_SIZE:       f32 = 190.0;
 pub const DEFAULT_FFT_SIZE:                usize = 2048;
 pub const DEFAULT_MIN_FREQ:                f32   = 30.0;
 pub const DEFAULT_MAX_FREQ:                f32   = 16_000.0;
-// Shifted −6 dB from the pre-window-gain-compensation values (−85/−20) so
-// the same input signal still maps to the same bar height after the audio
-// core was corrected to apply proper window gain (Hann ≈ +6.02 dB).
 pub const DEFAULT_MIN_DB:                  f32   = -91.0;
 pub const DEFAULT_MAX_DB:                  f32   = -26.0;
 pub const DEFAULT_TARGET_RANGE:            f32   = 60.0;
@@ -390,20 +387,27 @@ impl WindowFunction {
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
-pub enum FrequencyScaling { Linear, Logarithmic }
+pub enum FrequencyScaling { Linear, Logarithmic, Mel, Bark }
 impl Default for FrequencyScaling { fn default() -> Self { FrequencyScaling::Logarithmic } }
 impl FrequencyScaling {
     pub fn display_name(self) -> &'static str {
         match self {
             FrequencyScaling::Linear => "Linear",
             FrequencyScaling::Logarithmic => "Logarithmic",
+            FrequencyScaling::Mel => "Mel",
+            FrequencyScaling::Bark => "Bark",
         }
     }
     pub fn description(self) -> &'static str {
         match self {
             FrequencyScaling::Linear => "Even Hz spacing. Favours treble; bass compresses into a few bars.",
             FrequencyScaling::Logarithmic => "Matches human hearing. Gives bass and mids more visual space.",
+            FrequencyScaling::Mel => "Perceptual mel scale. Bass and mids get more visual space than linear; smoother than log.",
+            FrequencyScaling::Bark => "Bark scale (critical bands). Bark bands track how the ear separates frequencies.",
         }
+    }
+    pub fn all() -> [FrequencyScaling; 4] {
+        [FrequencyScaling::Linear, FrequencyScaling::Logarithmic, FrequencyScaling::Mel, FrequencyScaling::Bark]
     }
 }
 
@@ -482,6 +486,24 @@ impl BeatFocusMode {
     pub fn all() -> [BeatFocusMode; 3] {
         [BeatFocusMode::Bass, BeatFocusMode::Mid, BeatFocusMode::Treble]
     }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BpmMultiplier { Normal, Half, Double }
+impl Default for BpmMultiplier { fn default() -> Self { BpmMultiplier::Normal } }
+impl BpmMultiplier {
+    pub fn factor(self) -> f32 { match self { Self::Normal => 1.0, Self::Half => 0.5, Self::Double => 2.0 } }
+    pub fn display_name(self) -> &'static str {
+        match self { Self::Normal => "Normal", Self::Half => "Half-Time", Self::Double => "Double-Time" }
+    }
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Normal => "Report the detected BPM directly.",
+            Self::Half => "Report half the detected BPM. Visual pulse every other beat.",
+            Self::Double => "Report twice the detected BPM. Visual pulse twice per beat.",
+        }
+    }
+    pub fn all() -> [BpmMultiplier; 3] { [Self::Normal, Self::Half, Self::Double] }
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -587,10 +609,16 @@ pub struct AudioSettings {
     // Rhythm
     #[serde(default)]                                  pub beat_focus: BeatFocusMode,
     #[serde(default = "default_beat_sensitivity")]     pub beat_detection_sensitivity: f32,
-    #[serde(default = "default_energy_threshold")]     pub energy_threshold_multiplier: f32,
+    #[serde(default = "default_onset_threshold", alias = "energy_threshold_multiplier")]
+                                                       pub onset_threshold_multiplier: f32,
     #[serde(default)]                                  pub bpm_lock_enabled: bool,
     #[serde(default = "default_bpm_phase_smoothing")]  pub bpm_phase_smoothing: f32,
     #[serde(default = "default_beat_envelope_decay")]  pub beat_envelope_decay_ms: f32,
+    #[serde(default)]                                  pub bpm_multiplier: BpmMultiplier,
+    #[serde(default = "default_latency_offset_ms")]    pub latency_offset_ms: f32,
+
+    // Chroma
+    #[serde(default = "default_chroma_enabled")]       pub chroma_enabled: bool,
 }
 
 fn default_fft_size() -> usize { DEFAULT_FFT_SIZE }
@@ -618,7 +646,7 @@ fn default_average_size() -> usize { DEFAULT_AVERAGE_SIZE }
 fn default_peak_hold_ms() -> f32 { DEFAULT_PEAK_HOLD_MS }
 fn default_gravity_coeff() -> f32 { DEFAULT_GRAVITY_COEFF }
 fn default_beat_sensitivity() -> f32 { DEFAULT_BEAT_SENS }
-fn default_energy_threshold() -> f32 { DEFAULT_ENERGY_THRESHOLD }
+fn default_onset_threshold() -> f32 { DEFAULT_ENERGY_THRESHOLD }
 fn default_bpm_phase_smoothing() -> f32 { DEFAULT_BPM_PHASE_SMOOTHING }
 fn default_freq_smoothing() -> f32 { DEFAULT_FREQ_SMOOTHING }
 fn default_dc_block() -> bool { DEFAULT_DC_BLOCK }
@@ -626,6 +654,8 @@ fn default_per_band_ballistics() -> bool { DEFAULT_PER_BAND_BALLISTICS }
 fn default_per_frame_normalization() -> bool { DEFAULT_PER_FRAME_NORMALIZATION }
 fn default_beat_envelope_decay() -> f32 { DEFAULT_BEAT_ENVELOPE_DECAY_MS }
 fn default_harmonic_emphasis() -> bool { DEFAULT_HARMONIC_EMPHASIS }
+fn default_latency_offset_ms() -> f32 { 0.0 }
+fn default_chroma_enabled() -> bool { true }
 
 impl Default for AudioSettings {
     fn default() -> Self {
@@ -660,9 +690,12 @@ impl Default for AudioSettings {
 
             beat_focus: BeatFocusMode::default(),
             beat_detection_sensitivity: DEFAULT_BEAT_SENS,
-            energy_threshold_multiplier: DEFAULT_ENERGY_THRESHOLD,
+            onset_threshold_multiplier: DEFAULT_ENERGY_THRESHOLD,
             bpm_lock_enabled: false, bpm_phase_smoothing: DEFAULT_BPM_PHASE_SMOOTHING,
             beat_envelope_decay_ms: DEFAULT_BEAT_ENVELOPE_DECAY_MS,
+            bpm_multiplier: BpmMultiplier::Normal,
+            latency_offset_ms: 0.0,
+            chroma_enabled: true,
         }
     }
 }
@@ -750,7 +783,7 @@ impl AudioPreset {
                 sensitivity: 55.0, response_gamma: 1.8, spectrum_tilt: 1.5,
                 target_dynamic_range_db: 55.0, decay_time_ms: 200.0,
                 decay_mode: DecayMode::Exponential, average_size: 2,
-                beat_detection_sensitivity: 0.6, energy_threshold_multiplier: 1.4,
+                beat_detection_sensitivity: 0.6, onset_threshold_multiplier: 1.4,
                 ..d
             },
             AudioPreset::Rock => AudioSettings {
@@ -760,6 +793,7 @@ impl AudioPreset {
                 target_dynamic_range_db: 60.0, attack_time_ms: 3.0,
                 decay_time_ms: 250.0, decay_mode: DecayMode::Exponential,
                 average_size: 2, beat_detection_sensitivity: 0.55,
+                onset_threshold_multiplier: 1.4,
                 eq_mid_db: 1.5, beat_focus: BeatFocusMode::Mid, ..d
             },
             AudioPreset::Electronic => AudioSettings {
@@ -768,7 +802,7 @@ impl AudioPreset {
                 target_dynamic_range_db: 50.0, attack_time_ms: 0.0,
                 decay_time_ms: 150.0, decay_mode: DecayMode::Gravity,
                 average_size: 1, beat_detection_sensitivity: 0.7,
-                energy_threshold_multiplier: 1.3, bpm_lock_enabled: true,
+                onset_threshold_multiplier: 1.3, bpm_lock_enabled: true,
                 eq_bass_db: 1.5, eq_treble_db: 1.0, beat_focus: BeatFocusMode::Bass, ..d
             },
             AudioPreset::HipHop => AudioSettings {
@@ -777,7 +811,7 @@ impl AudioPreset {
                 target_dynamic_range_db: 55.0, attack_time_ms: 0.0,
                 decay_time_ms: 250.0, decay_mode: DecayMode::Gravity,
                 average_size: 1, beat_detection_sensitivity: 0.7,
-                energy_threshold_multiplier: 1.3, eq_bass_db: 2.5,
+                onset_threshold_multiplier: 1.3, eq_bass_db: 2.5,
                 beat_focus: BeatFocusMode::Bass, ..d
             },
             AudioPreset::Classical => AudioSettings {
@@ -786,7 +820,8 @@ impl AudioPreset {
                 sensitivity: 65.0, response_gamma: 1.2, spectrum_tilt: 4.5,
                 agc_enabled: false, attack_time_ms: 15.0, decay_time_ms: 500.0,
                 decay_mode: DecayMode::Linear, average_size: 3,
-                beat_detection_sensitivity: 0.4, max_frequency_hz: 18000.0,
+                beat_detection_sensitivity: 0.4, onset_threshold_multiplier: 1.8,
+                max_frequency_hz: 18000.0,
                 beat_focus: BeatFocusMode::Mid, ..d
             },
             AudioPreset::Piano => AudioSettings {
@@ -795,6 +830,7 @@ impl AudioPreset {
                 sensitivity: 60.0, response_gamma: 1.3, spectrum_tilt: 4.5,
                 attack_time_ms: 5.0, decay_time_ms: 600.0, decay_mode: DecayMode::Exponential,
                 average_size: 2, beat_detection_sensitivity: 0.35,
+                onset_threshold_multiplier: 1.6,
                 max_frequency_hz: 5000.0, eq_mid_db: 1.0,
                 harmonic_emphasis: true,
                 beat_focus: BeatFocusMode::Mid, ..d
@@ -804,14 +840,16 @@ impl AudioPreset {
                 min_decibels: -90.0, max_decibels: -27.0, target_dynamic_range_db: 60.0,
                 sensitivity: 55.0, response_gamma: 1.4, spectrum_tilt: 3.5,
                 attack_time_ms: 10.0, decay_time_ms: 400.0, decay_mode: DecayMode::Exponential,
-                average_size: 3, beat_detection_sensitivity: 0.45, ..d
+                average_size: 3, beat_detection_sensitivity: 0.45,
+                onset_threshold_multiplier: 1.6, ..d
             },
             AudioPreset::Ambient => AudioSettings {
                 fft_size: 4096, window_function: WindowFunction::BlackmanHarris,
                 min_decibels: -104.0, max_decibels: -34.0, target_dynamic_range_db: 70.0,
                 sensitivity: 70.0, response_gamma: 1.2, spectrum_tilt: 4.5,
                 attack_time_ms: 40.0, decay_time_ms: 800.0, decay_mode: DecayMode::Exponential,
-                average_size: 6, beat_detection_sensitivity: 0.3, ..d
+                average_size: 6, beat_detection_sensitivity: 0.3,
+                onset_threshold_multiplier: 1.8, ..d
             },
 
             AudioPreset::LoFi => AudioSettings {
@@ -821,7 +859,8 @@ impl AudioPreset {
                 attack_time_ms: 8.0, decay_time_ms: 400.0,
                 decay_mode: DecayMode::Exponential,
                 average_size: 4, beat_detection_sensitivity: 0.35,
-                energy_threshold_multiplier: 1.8, eq_treble_db: -1.0,
+                onset_threshold_multiplier: 1.6, chroma_enabled: false,
+                eq_treble_db: -1.0,
                 beat_focus: BeatFocusMode::Bass, ..d
             },
             AudioPreset::Metal => AudioSettings {
@@ -831,7 +870,7 @@ impl AudioPreset {
                 attack_time_ms: 1.0, decay_time_ms: 180.0,
                 decay_mode: DecayMode::Exponential,
                 average_size: 1, beat_detection_sensitivity: 0.7,
-                energy_threshold_multiplier: 1.4, eq_mid_db: 2.5, eq_treble_db: 1.0,
+                onset_threshold_multiplier: 1.4, eq_mid_db: 2.5, eq_treble_db: 1.0,
                 beat_focus: BeatFocusMode::Mid, ..d
             },
             AudioPreset::Country => AudioSettings {
@@ -839,6 +878,7 @@ impl AudioPreset {
                 sensitivity: 55.0, response_gamma: 1.4, spectrum_tilt: 3.0,
                 attack_time_ms: 6.0, decay_time_ms: 300.0,
                 average_size: 2, beat_detection_sensitivity: 0.5,
+                onset_threshold_multiplier: 1.5,
                 eq_mid_db: 1.0, beat_focus: BeatFocusMode::Mid, ..d
             },
             AudioPreset::RnB => AudioSettings {
@@ -847,6 +887,7 @@ impl AudioPreset {
                 attack_time_ms: 4.0, decay_time_ms: 320.0,
                 decay_mode: DecayMode::Exponential,
                 average_size: 2, beat_detection_sensitivity: 0.5,
+                onset_threshold_multiplier: 1.5,
                 eq_bass_db: 1.5, eq_mid_db: 1.0,
                 beat_focus: BeatFocusMode::Bass, ..d
             },
@@ -857,6 +898,7 @@ impl AudioPreset {
                 sensitivity: 60.0, response_gamma: 1.3, spectrum_tilt: 3.5,
                 attack_time_ms: 10.0, decay_time_ms: 400.0,
                 average_size: 3, beat_detection_sensitivity: 0.3,
+                onset_threshold_multiplier: 1.8, chroma_enabled: false,
                 eq_bass_db: -3.0, eq_mid_db: 2.0,
                 beat_focus: BeatFocusMode::Mid, ..d
             },
@@ -867,7 +909,8 @@ impl AudioPreset {
                 sensitivity: 65.0, response_gamma: 1.2, spectrum_tilt: 4.0,
                 attack_time_ms: 20.0, decay_time_ms: 600.0,
                 decay_mode: DecayMode::Exponential,
-                average_size: 4, beat_detection_sensitivity: 0.25,
+                average_size: 4, beat_detection_sensitivity: 0.15,
+                onset_threshold_multiplier: 2.0, chroma_enabled: false,
                 eq_bass_db: -4.0, eq_mid_db: 2.5, eq_treble_db: -1.0,
                 beat_focus: BeatFocusMode::Mid, ..d
             },
@@ -1060,7 +1103,7 @@ where D: serde::Deserializer<'de> {
 // App config
 // ─────────────────────────────────────────────────────────────
 
-pub const CURRENT_CONFIG_VERSION: u32 = 1;
+pub const CURRENT_CONFIG_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AppConfig {
@@ -1077,6 +1120,7 @@ pub struct AppConfig {
     #[serde(default = "default_settings_scale")] pub settings_scale: f32,
     #[serde(default = "default_open_settings_on_launch")] pub open_settings_on_launch: bool,
     #[serde(default = "default_show_help_text")] pub show_help_text: bool,
+    #[serde(default)] pub show_diagnostics: bool,
 
     // Outlines
     #[serde(default, alias = "bar_outline_enabled")]   pub visualizer_outline_enabled: bool,
@@ -1115,7 +1159,7 @@ pub struct AppConfig {
     #[serde(default)] pub custom_audio_presets: Vec<CustomAudioPreset>,
 
     // Schema version — 0 or missing = pre-v1 (pre window-gain compensation),
-    // 1 = current. Used to drive one-shot migrations in `migrate()`.
+    // 1 = post window-gain, 2 = post beat-engine / chroma / diagnostics.
     #[serde(default)] pub config_version: u32,
 
     // Legacy migration fields (kept for old configs; consumed during load())
@@ -1148,6 +1192,7 @@ impl Default for AppConfig {
             settings_scale: DEFAULT_SETTINGS_SCALE,
             open_settings_on_launch: DEFAULT_OPEN_SETTINGS_ON_LAUNCH,
             show_help_text: DEFAULT_SHOW_HELP_TEXT,
+            show_diagnostics: false,
             visualizer_outline_enabled: false,
             visualizer_outline_thickness: default_visualizer_outline_thickness(),
             visualizer_outline_color: default_visualizer_outline_color(),
@@ -1222,9 +1267,8 @@ impl AppConfig {
     }
 
     /// One-shot migration so persisted settings still look the same after the
-    /// audio-core window-gain correction (v0 → v1). Returns `true` if anything
-    /// was changed; the caller should save the config so the shift never runs
-    /// twice on the same file.
+    /// audio-core window-gain correction (v0 → v1) and the beat-engine / chroma
+    /// upgrade (v1 → v2). Returns `true` if anything changed.
     fn migrate(&mut self) -> bool {
         let mut changed = false;
 
@@ -1240,6 +1284,14 @@ impl AppConfig {
             }
 
             self.config_version = 1;
+            changed = true;
+        }
+
+        // v1 → v2: fields are all serde-defaulted, no data reshape needed.
+        // Bumping the version just records that the config has been through
+        // a beat-engine-aware save. Future migrations gate on this.
+        if self.config_version < 2 {
+            self.config_version = 2;
             changed = true;
         }
 
@@ -1272,12 +1324,9 @@ impl AppConfig {
                     config.audio.sensitivity = s.clamp(0.0, 100.0);
                 }
 
-                // ── audio-core v1 migration (window-gain compensation) ──
                 let migrated = config.migrate();
-
                 config.refresh_premade_presets();
 
-                // Persist immediately so the dB shift never runs twice on this file.
                 if migrated {
                     config.save();
                 }
