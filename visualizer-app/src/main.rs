@@ -14,12 +14,11 @@ use visualizer_core::{
     color,
     config::{
         self as cfg,
-        AppConfig, AudioPreset, BarInterpolation, BeatFocusMode, BlendMode, BpmMultiplier,
-        ChannelMixMode, ColorChangePreset, ColorMode, ColorPreset, ColorSource,
-        CustomAudioPreset, DecayMode, FrequencyDirection, FrequencyScaling, GradientPreset,
+        AppConfig, AudioPreset, BarInterpolation, BlendMode,
+        ColorMode, ColorSource, CustomAudioPreset, DecayMode, FrequencyDirection,
         GradientSource, GradientStop, MotionShape, PalettePriority, StaticDistributionMode,
-        StaticMultiPreset, TrackInfoConfig, TrackTextAlign, TrackTextColorMode,
-        VerticalColorStyle, VisualizerDirection, WeightingCurve, WindowFunction,
+        TrackInfoConfig, TrackTextAlign, TrackTextColorMode,
+        VerticalColorStyle, VisualizerDirection,
     },
     musicbee::{self, TrackInfo},
 };
@@ -444,24 +443,24 @@ fn apply_settings_style(ui: &mut egui::Ui, scale: f32) {
 
     v.override_text_color = Some(egui::Color32::from_rgb(238, 238, 238));
     v.selection.bg_fill = accent;
-    v.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+    v.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
 
     v.widgets.inactive.bg_fill = egui::Color32::from_rgb(30, 30, 30);
     v.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(30, 30, 30);
     v.widgets.inactive.bg_stroke =
-        egui::Stroke::new(1.0, egui::Color32::from_rgb(55, 55, 55));
+        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(55, 55, 55));
     v.widgets.inactive.fg_stroke =
-        egui::Stroke::new(1.0, egui::Color32::from_rgb(220, 220, 220));
+        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(220, 220, 220));
 
     v.widgets.hovered.bg_fill = egui::Color32::from_rgb(45, 45, 45);
     v.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(45, 45, 45);
-    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, accent);
-    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, accent);
+    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
 
     v.widgets.active.bg_fill = accent;
     v.widgets.active.weak_bg_fill = accent;
-    v.widgets.active.bg_stroke = egui::Stroke::new(1.0, accent);
-    v.widgets.active.fg_stroke = egui::Stroke::new(1.5, egui::Color32::WHITE);
+    v.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, accent);
+    v.widgets.active.fg_stroke = egui::Stroke::new(1.5_f32, egui::Color32::WHITE);
 
     v.widgets.inactive.rounding = egui::Rounding::same(6.0);
     v.widgets.hovered.rounding = egui::Rounding::same(6.0);
@@ -712,6 +711,7 @@ struct SettingsState {
     active_palettes: ActivePalettes,
     last_bpm: f32,
     system_fonts: Vec<(String, String)>,
+    tap_tx: crossbeam_channel::Sender<Instant>,
 }
 
 fn lock_state(m: &Mutex<SettingsState>) -> std::sync::MutexGuard<'_, SettingsState> {
@@ -844,7 +844,6 @@ impl VisualizerApp {
 
         let tap_hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyT);
         let tap_hotkey_id = tap_hotkey.id();
-        // Register the tap hotkey; if it fails, don't abort — the UI button still works.
         let _ = hotkey_manager.register(tap_hotkey);
 
         let (ui_cmd_tx, ui_cmd_rx) = crossbeam_channel::unbounded::<UiCmd>();
@@ -907,6 +906,7 @@ impl VisualizerApp {
             active_palettes: ActivePalettes::default(),
             last_bpm: 0.0,
             system_fonts: list_system_fonts(),
+            tap_tx: tap_tx.clone(),
         }));
 
         Self {
@@ -2423,7 +2423,7 @@ fn layout_spaced(
 
 fn paint_laid(painter: &egui::Painter, laid: &LaidText, pos: egui::Pos2, color: egui::Color32) {
     for (galley, off) in &laid.parts {
-        painter.galley_with_color(pos + *off, galley.clone(), color);
+        painter.galley(pos + *off, galley.clone(), color);
     }
 }
 
@@ -3932,7 +3932,7 @@ impl SettingsState {
             &mut a.latency_offset_ms,
             0.0..=200.0,
             "Latency Offset (ms)",
-            default_latency_offset_ms(),
+            0.0,
         );
         help_text(
             ui,
@@ -3956,7 +3956,7 @@ impl SettingsState {
             ui,
             &mut a.chroma_enabled,
             "Enable Chroma / Dominant Pitch",
-            default_chroma_enabled(),
+            true,
         );
         help_text(
             ui,
@@ -4752,7 +4752,6 @@ impl eframe::App for VisualizerApp {
             self.current_peaks.resize(n_bars, 0.0);
         }
 
-        // ── Interpolate between the two most recent audio frames (feature 23) ──
         while let Ok(frame) = self.audio_rx.try_recv() {
             self.prev_frame = self.next_frame.take();
             self.next_frame = Some(frame);
@@ -4811,7 +4810,6 @@ impl eframe::App for VisualizerApp {
 
         let mut vis_rect = self.compute_overlay_rect(ctx, monitor);
 
-        // Ensure diagnostics overlay fits inside the window.
         if self.config.show_diagnostics {
             let diag_rect = egui::Rect::from_min_size(
                 monitor.min + egui::vec2(10.0, 10.0),
