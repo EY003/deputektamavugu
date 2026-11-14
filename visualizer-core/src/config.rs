@@ -1288,8 +1288,6 @@ impl AppConfig {
         }
 
         // v1 → v2: fields are all serde-defaulted, no data reshape needed.
-        // Bumping the version just records that the config has been through
-        // a beat-engine-aware save. Future migrations gate on this.
         if self.config_version < 2 {
             self.config_version = 2;
             changed = true;
