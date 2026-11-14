@@ -13,7 +13,7 @@ use realfft::{RealFftPlanner, RealToComplex};
 use wasapi::*;
 
 use crate::config::{
-    AudioSettings, BeatFocusMode, BpmMultiplier, ChannelMixMode, DecayMode,
+    AudioSettings, BpmMultiplier, ChannelMixMode, DecayMode,
     FrequencyScaling, WeightingCurve, WindowFunction,
 };
 
@@ -187,6 +187,8 @@ impl AudioEngine {
     pub fn tap(&self) {
         let _ = self.tap_tx.try_send(Instant::now());
     }
+
+    pub fn tap_sender(&self) -> Sender<Instant> { self.tap_tx.clone() }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -623,7 +625,7 @@ fn analysis_loop<F: Fn() + Send + 'static>(
 
 struct OnsetDetector {
     prev_mags: Vec<f32>,
-    band_flux_history: [VecDeque<f32>; 3],  // kick / snare / hat
+    band_flux_history: [VecDeque<f32>; 3],
     flux_history_total: VecDeque<f32>,
     band_armed: [bool; 3],
     total_armed: bool,
@@ -711,7 +713,6 @@ impl OnsetDetector {
         let mult = threshold_mult.max(1.0) * (1.0 - sens * 0.5);
         let min_gap = MIN_BEAT_GAP_S;
 
-        // Per-band detection
         for b in 0..3 {
             let h = &self.band_flux_history[b];
             let avg = h.iter().sum::<f32>() / h.len() as f32;
@@ -734,7 +735,6 @@ impl OnsetDetector {
             }
         }
 
-        // Total flux
         let total_avg = self.flux_history_total.iter().sum::<f32>()
             / self.flux_history_total.len() as f32;
         let total_thr = total_avg * mult;
@@ -784,9 +784,8 @@ struct AudioProcessor {
 
     agc_envelope: f32,
 
-    // Rhythm
     onset_detector: OnsetDetector,
-    beat_times: VecDeque<f64>,            // real detections only (for BPM)
+    beat_times: VecDeque<f64>,
     bpm_raw: f32,
     bpm_multiplier: BpmMultiplier,
     phase: f32,
@@ -798,28 +797,17 @@ struct AudioProcessor {
     tap_times: VecDeque<Instant>,
     tap_override_until: Option<Instant>,
 
-    // Band levels
     band_levels: [f32; 4],
-
-    // Waveform rolling buffer
     waveform_buf: Vec<f32>,
     waveform_pos: usize,
-
-    // Chroma
     chroma_enabled: bool,
     chroma: [f32; 12],
     dominant_pitch_hz: f32,
     dominant_pitch_midi: f32,
-
-    // Spectrum row
     spectrum_row: Vec<f32>,
-
-    // Last computation snapshot (for silent_frame)
     last_rms: f32,
     last_peak: f32,
     last_onsets: Onsets,
-
-    // Weighting/offset cache
     bar_offset_db: Vec<f32>,
     offset_centers: Vec<f32>,
     offset_params: [f32; 4],
@@ -906,7 +894,6 @@ impl AudioProcessor {
     fn record_tap(&mut self, t: Instant) {
         self.tap_times.push_back(t);
         while self.tap_times.len() > 8 { self.tap_times.pop_front(); }
-        // Prune taps older than 3 s
         while let Some(&first) = self.tap_times.front() {
             if t.duration_since(first) > Duration::from_secs(3) {
                 self.tap_times.pop_front();
@@ -924,7 +911,6 @@ impl AudioProcessor {
                 if median > 0.15 && median < 2.0 {
                     self.bpm_raw = (60.0 / median) as f32;
                     self.tap_override_until = Some(t);
-                    // Reset the flywheel to fire from the last tap.
                     let period = 60.0 / (self.bpm_raw * self.bpm_multiplier.factor()).max(1.0);
                     self.phase = 0.0;
                     self.next_beat_time = self.time_elapsed + period as f64;
@@ -1107,7 +1093,6 @@ impl AudioProcessor {
         }
         let window_slice = &history[history.len() - n_fft..];
 
-        // ── RMS / peak ──
         let raw_rms = {
             let sum_sq: f32 = window_slice.iter().map(|x| x * x).sum();
             (sum_sq / n_fft as f32).sqrt()
@@ -1116,7 +1101,6 @@ impl AudioProcessor {
         self.last_rms = raw_rms;
         self.last_peak = raw_peak;
 
-        // ── Rolling waveform ──
         let n_new = window_slice.len().min(WAVEFORM_LEN);
         let to_copy = &window_slice[window_slice.len() - n_new..];
         if n_new >= WAVEFORM_LEN {
@@ -1129,7 +1113,6 @@ impl AudioProcessor {
             }
         }
 
-        // ── AGC ──
         if s.agc_enabled && raw_rms > 1e-4 {
             let desired = (0.08 / raw_rms.max(1e-6)).clamp(0.01, 20.0);
             let coeff = if desired < self.agc_envelope { s.agc_attack.clamp(0.0001, 1.0) }
@@ -1143,7 +1126,6 @@ impl AudioProcessor {
         let agc_gain = self.agc_envelope.clamp(0.01, 20.0);
         let user_gain = s.raw_gain.max(0.01) * agc_gain;
 
-        // ── FFT ──
         self.input_buffer.copy_from_slice(window_slice);
         for i in 0..n_fft { self.input_buffer[i] *= self.window[i]; }
         if self.fft.process_with_scratch(
@@ -1155,7 +1137,6 @@ impl AudioProcessor {
         let norm = self.window_gain * user_gain;
         let bin_width = self.sample_rate / n_fft as f32;
 
-        // ── Band levels ──
         let band_hz = [(20.0, 100.0), (100.0, 500.0), (500.0, 2000.0), (2000.0, 8000.0)];
         for (b, (lo_hz, hi_hz)) in band_hz.iter().enumerate() {
             let lo = ((lo_hz / bin_width) as usize).min(nyquist);
@@ -1166,7 +1147,6 @@ impl AudioProcessor {
             self.band_levels[b] = ((sum / count) * norm).max(0.0).min(1.0);
         }
 
-        // ── Spectrum row ──
         for i in 0..SPECTRUM_ROW_LEN {
             let t = i as f32 / (SPECTRUM_ROW_LEN - 1) as f32;
             let freq = s.min_frequency_hz * (s.max_frequency_hz / s.min_frequency_hz).powf(t);
@@ -1175,7 +1155,6 @@ impl AudioProcessor {
             self.spectrum_row[i] = (20.0 * (mag + 1e-9).log10() + 91.0).max(0.0) / 91.0;
         }
 
-        // ── Chroma + dominant pitch ──
         if self.chroma_enabled {
             self.compute_chroma_and_pitch(bin_width, nyquist);
         } else {
@@ -1184,7 +1163,6 @@ impl AudioProcessor {
             self.dominant_pitch_midi = 0.0;
         }
 
-        // ── Raw bar magnitudes (same as before) ──
         for i in 0..num_bars {
             let (start, end) = self.bin_ranges[i];
             let end = end.min(nyquist).max(start + 1);
@@ -1280,7 +1258,6 @@ impl AudioProcessor {
         self.update_ballistics(&smoothed, s, dt);
         self.smoothed = smoothed;
 
-        // ── Rhythm ──
         let (beat, beat_predicted, phase, beat_in) = self.detect_rhythm(s, dt, bin_width, nyquist);
 
         Some(BarFrame {
@@ -1390,8 +1367,6 @@ impl AudioProcessor {
         bin_width: f32,
         nyquist: usize,
     ) -> (bool, bool, f32, f32) {
-        // ── Spectral flux onsets ──
-        // Copy magnitudes out (avoid borrow conflict with &mut self.onset_detector)
         let mut mags = vec![0.0f32; nyquist];
         for k in 1..nyquist { mags[k] = self.output_buffer[k].norm(); }
 
@@ -1403,19 +1378,16 @@ impl AudioProcessor {
             self.time_elapsed,
         );
 
-        // ── Tap override window ──
         let in_tap_override = self.tap_override_until
             .map(|u| u.elapsed() < Duration::from_secs(5))
             .unwrap_or(false);
 
-        // ── Is this a "real" beat? ──
         let since_last_real = self.time_elapsed
             - self.beat_times.back().copied().unwrap_or(f64::NEG_INFINITY);
         let is_real_beat = any_fire
             && !in_tap_override
             && since_last_real > MIN_BEAT_GAP_S;
 
-        // Update detected BPM from real beats
         if is_real_beat {
             self.beat_times.push_back(self.time_elapsed);
             while self.beat_times.len() > MAX_BEATS { self.beat_times.pop_front(); }
@@ -1431,14 +1403,12 @@ impl AudioProcessor {
             }
         }
 
-        // ── Beat clock (flywheel) ──
         let eff_bpm = self.effective_bpm();
         let mut fire_real = false;
         let mut fire_predicted = false;
 
         if is_real_beat {
             let period_s = if eff_bpm > 20.0 { 60.0 / eff_bpm } else { 0.5 };
-            // Soft phase correction: only if detection is on-beat
             let phase_error = if self.phase < 0.5 { self.phase } else { 1.0 - self.phase };
             let on_beat = phase_error < 0.35;
             if on_beat && s.bpm_lock_enabled {
@@ -1452,17 +1422,14 @@ impl AudioProcessor {
             fire_real = true;
         }
 
-        // Advance phase, detect wrap for predicted fire
         let eff_bpm = self.effective_bpm();
         if eff_bpm > 20.0 {
             let period_s = 60.0 / eff_bpm;
             self.phase = (self.phase + dt / period_s).rem_euclid(1.0);
 
-            // Flywheel: if we're past next_beat_time + grace and not firing real this frame
             let now = self.time_elapsed;
             let grace = 0.08;
             if !fire_real && now > self.next_beat_time + grace {
-                // Only fire predicted if we haven't fired anything very recently
                 let since_fired = now - self.last_fired_beat_time;
                 if since_fired > period_s as f64 * 0.6 {
                     fire_predicted = true;
@@ -1470,7 +1437,6 @@ impl AudioProcessor {
                     self.next_beat_time = now + period_s as f64;
                     self.phase = 0.0;
                 } else {
-                    // Catch up: skip ahead
                     self.next_beat_time = now + period_s as f64;
                 }
             }
@@ -1479,7 +1445,6 @@ impl AudioProcessor {
             self.beat_in = 0.0;
         }
 
-        // ── Envelope ──
         if fire_real {
             self.beat_envelope = 1.0;
         } else if fire_predicted {
@@ -1490,7 +1455,6 @@ impl AudioProcessor {
             if self.beat_envelope < 0.001 { self.beat_envelope = 0.0; }
         }
 
-        // Latency offset shift on phase
         let phase_shifted = if eff_bpm > 20.0 && s.latency_offset_ms > 0.0 {
             let period_s = 60.0 / eff_bpm;
             let shift = s.latency_offset_ms / 1000.0 / period_s;
@@ -1572,7 +1536,6 @@ fn mel_to_hz(m: f32) -> f32 { 700.0 * (10f32.powf(m / 2595.0) - 1.0) }
 /// Bark approximation (Traunmüller): 26.81 * f / (1960 + f) - 0.53
 fn hz_to_bark(f: f32) -> f32 { 26.81 * f / (1960.0 + f) - 0.53 }
 fn bark_to_hz(z: f32) -> f32 {
-    // Invert approximately
     let z = z + 0.53;
     1960.0 * z / (26.81 - z)
 }
@@ -1716,8 +1679,7 @@ mod tests {
     #[test]
     fn hann_window_peak_is_one_at_centre() {
         let w = make_window(WindowFunction::Hann, 1024);
-        let mid = w[512];
-        assert!((mid - 1.0).abs() < 1e-3);
+        assert!((w[512] - 1.0).abs() < 1e-3);
         assert!((w[0]).abs() < 1e-6);
         assert!((w[1023]).abs() < 1e-3);
     }
@@ -1800,14 +1762,12 @@ mod tests {
         let mut dc = DcBlocker::new(48000.0);
         let mut buf = vec![1.0f32; 48000];
         dc.apply(&mut buf);
-        // After 1 s, DC should be near 0
         assert!(buf[47999].abs() < 0.1);
     }
 
     #[test]
     fn recompute_bpm_from_known_intervals() {
         let mut p = AudioProcessor::new(48000.0);
-        // 120 BPM = 0.5 s intervals
         for t in [1.0, 1.5, 2.0, 2.5, 3.0] {
             p.beat_times.push_back(t);
         }
@@ -1830,7 +1790,6 @@ mod tests {
             assert!((f2 - f).abs() / f.max(1.0) < 0.01, "mel roundtrip {f} -> {f2}");
             let z = hz_to_bark(f);
             let f3 = bark_to_hz(z);
-            // Bark inverse is approximate
             assert!((f3 - f).abs() / f.max(1.0) < 0.05, "bark roundtrip {f} -> {f3}");
         }
     }
@@ -1869,9 +1828,11 @@ mod tests {
         settings.dc_block = false;
         settings.agc_enabled = false;
         settings.noise_gate = 0.0;
-        settings.smoothing_setup_for_test();
+        settings.attack_time_ms = 0.0;
+        settings.decay_time_ms = 100.0;
+        settings.average_size = 1;
+        settings.per_frame_normalization = false;
 
-        // 1 kHz sine, long enough for FFT
         let freq = 1000.0f32;
         let n = 4096;
         let mut buf = vec![0.0f32; n];
@@ -1880,21 +1841,10 @@ mod tests {
         }
 
         let frame = p.process(&buf, &settings, 1.0 / 60.0, Instant::now()).unwrap();
-        // Peak bar should be near 1 kHz
         let peak_i = frame.values.iter().enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .map(|(i, _)| i).unwrap();
         let peak_hz = compute_bar_centers_hz(64, FrequencyScaling::Logarithmic, 30.0, 16000.0)[peak_i];
         assert!((peak_hz - freq).abs() / freq < 0.5, "peak at {peak_hz} Hz, expected ~{freq}");
-    }
-
-    // Helper extension for tests only
-    impl AudioSettings {
-        fn smoothing_setup_for_test(&mut self) {
-            self.attack_time_ms = 0.0;
-            self.decay_time_ms = 100.0;
-            self.average_size = 1;
-            self.per_frame_normalization = false;
-        }
     }
 }
