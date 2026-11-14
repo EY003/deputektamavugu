@@ -2423,7 +2423,7 @@ fn layout_spaced(
 
 fn paint_laid(painter: &egui::Painter, laid: &LaidText, pos: egui::Pos2, color: egui::Color32) {
     for (galley, off) in &laid.parts {
-        painter.galley(pos + *off, galley.clone(), color);
+        painter.galley_with_override_text_color(pos + *off, galley.clone(), color);
     }
 }
 
@@ -4453,15 +4453,18 @@ fn fft_size_combo(ui: &mut egui::Ui, a: &mut visualizer_core::config::AudioSetti
 // ═══════════════════════════════════════════════════════════════
 
 impl VisualizerApp {
-    fn draw_diagnostics_window(&self, ctx: &egui::Context) {
+        fn draw_diagnostics_window(&self, ctx: &egui::Context) {
         let stats = &self.audio_stats;
         let sr = f32::from_bits(stats.sample_rate_bits.load(Ordering::Relaxed));
+        let frame = egui::Frame::window(&ctx.style())
+            .shadow(egui::epaint::Shadow::NONE);
         egui::Window::new("Diagnostics")
             .id(egui::Id::new("diag_window"))
             .collapsible(true)
             .resizable(true)
             .default_pos(egui::pos2(20.0, 20.0))
             .default_width(320.0)
+            .frame(frame)
             .show(ctx, |ui| {
                 egui::Grid::new("diag_grid").num_columns(2).striped(true).show(ui, |ui| {
                     ui.label("Device:"); ui.label(&self.audio_device_name); ui.end_row();
